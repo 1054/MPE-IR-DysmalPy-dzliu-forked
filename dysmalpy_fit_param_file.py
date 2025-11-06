@@ -1,0 +1,83 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+
+import os, sys, re, json, copy
+import numpy as np
+
+sys.path.insert(1, os.path.abspath(os.path.dirname(__file__)))
+import dysmalpy
+print('dysmalpy.__path__', dysmalpy.__path__)
+print('np.__version__', np.__version__) # need to be < 2.0.0
+
+from dysmalpy.fitting_wrappers import dysmalpy_fit_single
+from dysmalpy.fitting_wrappers import utils_io
+from dysmalpy import fitting, plotting
+
+
+if len(sys.argv) <= 1:
+    print('Usage: input a *.params file')
+    sys.exit()
+
+
+param_file = sys.argv[1]
+
+
+# load parameter file
+params = utils_io.read_fitting_params(fname=param_file)
+params['outdir'] = params['outdir'].rstrip('/')+'/' # ensure_path_trailing_slash
+
+# setup target galaxy
+gal, output_options = utils_io.setup_single_galaxy(params=params)
+
+# setup fitter
+fitter = utils_io.setup_fitter(params=params)
+
+# set output options
+output_options.set_output_options(gal, fitter)
+output_options.overwrite = False
+fit_dict = output_options.as_dict()
+#print('fit_dict', fit_dict)
+
+# do fitting
+fit_results = fitter.fit(gal, output_options)
+
+
+# plot results
+
+plotting.plot_bestfit(
+    fit_results, 
+    gal, 
+    fileout = params['outdir']+'output_plot_bestfit.pdf',
+    vcrop = True,
+    vcrop_value = 350.,
+    remove_shift = False, 
+    overwrite = True, 
+)
+
+print('plot_data_model_comparison')
+plotting.plot_data_model_comparison(
+    gal = gal,
+    fileout = params['outdir']+'output_fit_datmod_comp.pdf',
+    show_contours = False, 
+    vcrop = True,
+    vcrop_value = 350.,
+    overwrite = True, 
+)
+
+
+print('fit_results.plot_corner')
+fit_results.plot_corner(
+    gal = gal, 
+    fileout = params['outdir']+'output_mcmc_corner.pdf',
+    overwrite = True
+)
+
+
+print('fit_results.plot_trace')
+fit_results.plot_trace(
+    fileout = params['outdir']+'output_mcmc_trace.pdf',
+    overwrite = True
+)
+
+

@@ -13,6 +13,7 @@ import copy
 from collections import OrderedDict
 
 import os
+import re
 import datetime
 
 # Third party imports
@@ -167,19 +168,20 @@ def plot_run(bayesianResults, fileout=None, overwrite=False):
 
 
 def plot_corner(bayesianResults, gal=None, fileout=None, 
-                step_slice=None, blob_name=None, overwrite=False):
+                step_slice=None, blob_name=None, param_ranges=None, overwrite=False):
     """
     Plot corner plot of Bayesian result posterior distributions.
     Optional:
     step slice: 2 element tuple/array with beginning and end step number to use
+    param_ranges: parameter ranges, example: {'sigma0': [10.0, 90.0], 'total_mass': [9.5, 11.5], 'r_eff_disk': [1.0, 10.0]}
     """
 
     if bayesianResults.fit_method.lower() == 'mcmc':
         plot_corner_mcmc(bayesianResults, gal=gal, fileout=fileout, 
-                         step_slice=step_slice, blob_name=blob_name, 
+                         step_slice=step_slice, blob_name=blob_name, param_ranges=param_ranges,
                          overwrite=overwrite)
     elif bayesianResults.fit_method.lower() == 'nested':
-        plot_corner_nested(bayesianResults, fileout=fileout, overwrite=overwrite)
+        plot_corner_nested(bayesianResults, fileout=fileout, param_ranges=param_ranges, overwrite=overwrite)
     else:
         raise ValueError("plot_corner() not supported for fit method: {}".format(bayesianResults.fit_method))
 
@@ -319,7 +321,7 @@ def plot_run_nested(bayesianResults, fileout=None, overwrite=False):
 
 
 def plot_corner_mcmc(mcmcResults, gal=None, fileout=None, step_slice=None, 
-                     blob_name=None, overwrite=False):
+                     blob_name=None, param_ranges=None, overwrite=False):
     """
     Plot corner plot of MCMC result posterior distributions.
     Optional:
@@ -494,6 +496,24 @@ def plot_corner_mcmc(mcmcResults, gal=None, fileout=None, step_slice=None,
                     ax.set_xlim(xlim)
                     ax.set_ylim(ylim)
 
+    # allow user to adjust param display ranges
+    if param_ranges is not None:
+        # example: param_ranges = {'sigma0': [10.0, 100.0]}
+        ipar = -1
+        for key in param_ranges:
+            for i, name in enumerate(names):
+                #print('DEBUG', key, name, param_ranges)
+                if re.search(r'\b'+key+r'\b', name) or re.search(r'\b'+key.replace('_',' ')+r'\b', name):
+                    #print('DEBUG', 'matched!')
+                    ipar = i
+                    break
+            if ipar >= 0:
+                limit = param_ranges[key]
+                for k in range(ipar):
+                    axes[ipar*nFreeParam+k].set_ylim(limit)
+                for k in range(ipar, nFreeParam):
+                    axes[k*nFreeParam+ipar].set_xlim(limit)
+
     if fileout is not None:
         plt.savefig(fileout, bbox_inches='tight')
         plt.close(fig)
@@ -504,7 +524,7 @@ def plot_corner_mcmc(mcmcResults, gal=None, fileout=None, step_slice=None,
 
 
 
-def plot_corner_nested(bayesianResults, fileout=None, overwrite=False):
+def plot_corner_nested(bayesianResults, fileout=None, param_ranges=None, overwrite=False):
 
     from dynesty import plotting as dyplot
 
@@ -4052,11 +4072,13 @@ def extract_2D_from_cube_general(cube, err=None, mask=None,
     if extrac_type == 'moment':
         flux = datacube.moment0().to(u.km/u.s).value
         vel = datacube.moment1().to(u.km/u.s).value
-        disp = datacube.linewidth_sigma().to(u.km/u.s).value
+        #<DZLIU><20251104># disp = datacube.linewidth_sigma().to(u.km/u.s).value
+        disp = np.sqrt(np.abs(datacube.moment2().to((u.km/u.s)**2).value)) #<DZLIU><20251104>#
     elif extrac_type == 'gauss':
         mom0 = datacube.moment0().to(u.km/u.s).value
         mom1 = datacube.moment1().to(u.km/u.s).value
-        mom2 = datacube.linewidth_sigma().to(u.km/u.s).value
+        #<DZLIU><20251104># mom2 = datacube.linewidth_sigma().to(u.km/u.s).value
+        mom2 = np.sqrt(np.abs(datacube.moment2().to((u.km/u.s)**2).value)) #<DZLIU><20251104># 
 
         # Clean up NaNs in moms for initial guesses:
         mom0[~np.isfinite(mom0)] = 0.0

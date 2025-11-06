@@ -10,6 +10,9 @@ import pandas as pd
 import astropy.units as u
 import astropy.constants as apy_con
 
+if not hasattr(np, 'NaN'):
+    np.NaN = np.nan
+
 try:
     import tkinter_io
 except ImportError:

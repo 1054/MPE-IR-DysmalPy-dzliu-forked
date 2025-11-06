@@ -835,21 +835,21 @@ double *fitLeastChiSquares1DForDataCube(\
         gsl_vector *y_view_vector = NULL;
         gsl_vector_view y_view = gsl_matrix_column(dataMatrix, k);
         y_view_vector = &y_view.vector;
-        if (std::isnan(gsl_vector_max(y_view_vector))) { continue; } /* skips if data includes NaN */ 
+        //20251008// if (std::isnan(gsl_vector_max(y_view_vector))) { continue; } /* skips if data includes NaN */ 
         
         // load yerr array for this pixel
         gsl_vector *yerr_view_vector = NULL;
         if (NULL != dataerr) {
             gsl_vector_view yerr_view = gsl_matrix_column(dataerrMatrix, k);
             yerr_view_vector = &yerr_view.vector; 
-            if (std::isnan(gsl_vector_max(yerr_view_vector))) { continue; } /* skips if data includes NaN */
+            //20251008// if (std::isnan(gsl_vector_max(yerr_view_vector))) { continue; } /* skips if data includes NaN */
         }
         
         // load initparams array for this pixel
         gsl_vector *initparams_view_vector = NULL;
         gsl_vector_view initparams_view = gsl_matrix_column(paramsMatrix, k);
         initparams_view_vector = &initparams_view.vector;
-        if (std::isnan(gsl_vector_max(initparams_view_vector))) { continue; } /* skips if data includes NaN */
+        if (std::isnan(gsl_vector_max(initparams_view_vector))) { continue; } /* skips if init params of this pixel include NaN */
         
         gsl_vector_view outall_view = gsl_matrix_column(outallMatrix, k);
         gsl_vector *outall_view_vector = &outall_view.vector;

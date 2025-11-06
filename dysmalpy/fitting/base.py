@@ -407,9 +407,9 @@ class BayesianFitResults(FitResults):
                 self.plot_run(fileout=f_plot_run, overwrite=overwrite)
 
 
-    def plot_corner(self, gal=None, fileout=None, overwrite=False):
+    def plot_corner(self, gal=None, param_ranges=None, fileout=None, overwrite=False):
         """Plot/replot the corner plot for the Bayesian fitting"""
-        plotting.plot_corner(self, gal=gal, fileout=fileout, overwrite=overwrite)
+        plotting.plot_corner(self, gal=gal, param_ranges=param_ranges, fileout=fileout, overwrite=overwrite)
 
     def plot_trace(self, fileout=None, overwrite=False):
         """Plot/replot the trace for the Bayesian fitting"""

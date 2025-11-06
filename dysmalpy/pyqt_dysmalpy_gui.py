@@ -1,6 +1,5 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Copyright (c) MPE/IR-Submm Group. See LICENSE.rst for license information. 
 """
 A GUI for the galaxy kinematics modeling and fitting tool DysmalPy.
 
@@ -13,6 +12,11 @@ Last updates:
     - 2021-08-04 can save lensing source plane and image plane cubes
     - 2021-08-05 change logging.DEBUG to logging.INFO
     - 2021-08-12 substantially rewriting to use multiprocessing as scipy.linalg.inv breaks in QThread
+    - 2022-08-17 adding non-circular motion, LineEditModelParamsDictForNonCirc
+    - 2022-12-02 adding utils_cube_populating, zcalc_with_c, psf_fwhm_major
+    - 2023-01-30 try import dysmal first so that this script can be run from anywhere.
+    - 2024-08-30 updated for new dysmalpy
+    - 2025-08-27 
     
 Issues:
     - 2021-08-12 (solved) 3D cube fitting breaks, tracing the error to
@@ -22,14 +26,16 @@ Issues:
                  scipy.linalg.basic `getrf`. Have to use multiprocessing and "spawn".
     - 2021-08-12 for 3D cube fitting, plot_spaxel_compare_3D_cubes for a 100x100x80 cube took
                  nearly 1 hour!
+    - 2023-03-06 input param file must ends with ".params"
     
 """
 
-import os, sys, re, copy, json, time, datetime, ast, shutil, operator
+import os, sys, re, copy, json, time, datetime, ast, shutil, operator, base64, traceback
 import numpy as np
 from enum import Enum
 from pprint import pprint
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
+from scipy.interpolate import griddata, interp2d
 
 import logging
 #from logutils.queue import QueueHandler, QueueListener
@@ -64,16 +70,34 @@ else:
 import threading
 from threading import Thread
 
-from dysmalpy import galaxy, models, fitting, instrument, parameters, plotting, config, data_classes
-from dysmalpy.fitting_wrappers import utils_io
-from dysmalpy.fitting_wrappers.plotting import plot_bundle_1D, plot_bundle_2D
+try:
+    import dysmalpy
+except:
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    #print('script_dir:', script_dir)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+        #print('sys.path:', sys.path)
+    import dysmalpy
+
+from dysmalpy import galaxy, models, fitting, instrument, parameters, plotting, config, data_classes, aperture_classes
+#from dysmalpy.fitting_wrappers.plotting import plot_bundle_1D, plot_bundle_2D #<20240821># function no longer valid
 from dysmalpy.fitting_wrappers.dysmalpy_fit_single import dysmalpy_fit_single
-from dysmalpy.fitting_wrappers.setup_gal_models import (setup_gal_model_base,
-        setup_single_object_1D, setup_single_object_2D, setup_single_object_3D,
-        setup_fit_dict, setup_lensing_dict)
-# from dysmalpy.fitting_wrappers import data_io
+#<20240830>#from dysmalpy.fitting_wrappers.setup_gal_models import (setup_gal_model_base,
+#<20240830>#        setup_single_object_1D, setup_single_object_2D, setup_single_object_3D,
+#<20240830>#        setup_fit_dict, setup_lensing_dict)
+from dysmalpy.fitting_wrappers.setup_gal_models import (setup_gal_model_base, 
+         setup_single_galaxy, 
+         make_empty_observation, setup_instrument_params, setup_basic_aperture_types, 
+         load_galaxy)
+#from dysmalpy.fitting_wrappers import data_io
+from dysmalpy.fitting_wrappers import utils_io
+from dysmalpy.fitting_wrappers import data_io as fwdata_io
 from dysmalpy import data_io
 from dysmalpy.utils import apply_smoothing_3D, rebin, gaus_fit_sp_opt_leastsq
+ensure_path_trailing_slash = data_io.ensure_path_trailing_slash
+#plot_1D_rotcurve_components = utils_io.plot_1D_rotcurve_components # before 2025
+from dysmalpy.fitting_wrappers.plotting import plot_1D_rotcurve_components # 202509
 
 # <DZLIU><20210726> ++++++++++
 from dysmalpy import lensing
@@ -90,8 +114,23 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.visualization import SqrtStretch, AsinhStretch, MinMaxInterval, ImageNormalize
 
-from regions import (DS9Parser, read_ds9, write_ds9, RectangleSkyRegion, PixelRegion, PolygonPixelRegion,
-                     CirclePixelRegion, RegionMask, PixCoord, ds9_objects_to_string)
+import regions
+from regions import (SkyRegion, PixelRegion, PointSkyRegion, PointPixelRegion, CircleSkyRegion, CirclePixelRegion, 
+                     EllipseSkyRegion, EllipsePixelRegion, PolygonSkyRegion, PolygonPixelRegion, 
+                     RectangleSkyRegion, RectanglePixelRegion, 
+                     RegionMask, PixCoord
+                    ) # https://astropy-regions.readthedocs.io/en/latest/shapes.html
+try:
+    # old regions version < 0.6
+    from regions import DS9Parser, ds9_objects_to_string
+    from regions import read_ds9, write_ds9
+except:
+    # new regions version >= 0.6
+    from regions import Regions
+    read_ds9 = lambda x: Regions.read(x, format='ds9')
+    write_ds9 = lambda x: Regions.write(x, format='ds9')
+    #DS9Parser = lambda x: Regions.parse(x, format='ds9')
+    #ds9_objects_to_string =
 
 from spectral_cube import SpectralCube
 
@@ -109,6 +148,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import matplotlib.patheffects as path_effects
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle, Ellipse, Polygon
 from matplotlib.backend_bases import MouseButton
@@ -125,8 +165,10 @@ from PyQt5.QtWidgets import (QWidget, QMainWindow, QApplication, QAction, qApp, 
                              QShortcut)
 from PyQt5.QtGui import (QIcon, QFont, QImage, QPixmap, QPolygon, QPolygonF, QPainter, QPen, QTransform,
                          QRegExpValidator, QKeySequence)
-from PyQt5.QtCore import (Qt, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, QThread,
+from PyQt5.QtCore import (Qt, QByteArray, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, QThread,
                           QRegExp, QUrl, pyqtSignal, pyqtSlot, pyqtBoundSignal)
+
+
 
 #import warnings
 #warnings.simplefilter("error")
@@ -140,6 +182,17 @@ logging.getLogger('DysmalPy').setLevel(logger.level)
 #logger.debug('models._dir_noordermeer: '+str(models._dir_noordermeer))
 
 
+def setup_lensing_dict(params=None, append_to_dict=None):
+    lensing_dict = {}
+    if append_to_dict is not None:
+        if isinstance(append_to_dict, dict):
+            lensing_dict = append_to_dict
+    for key in params.keys():
+        if key.startswith('lensing'):
+            lensing_dict[key] = params[key]
+    return lensing_dict
+
+
 class NumpyEncoder(json.JSONEncoder):
     """ Special json encoder for numpy types """
     def default(self, obj):
@@ -151,6 +204,313 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return json.JSONEncoder.default(self, obj)
 
+
+def iconFromBase64(base64_data):
+    pixmap = QPixmap()
+    pixmap.loadFromData(base64.b64decode(base64_data)) # QByteArray.fromBase64(base64_data)
+    icon = QIcon()
+    icon.addPixmap(pixmap)
+    return icon
+
+
+def getIconDysmalPy():
+    image_base64 = """
+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
+"""
+    # Sedona's art, DPy_favicon_blk-diag-128.png
+    return iconFromBase64(image_base64)
 
 
 class QDysmalPyGUI(QMainWindow):
@@ -229,6 +589,7 @@ class QDysmalPyGUI(QMainWindow):
         self.TabPageB5 = QWidget()
         self.TabPageB6 = QWidget()
         self.TabPageB7 = QWidget()
+        self.TabPageB8 = QWidget()
         self.TabPageA1.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
         self.TabPageA2.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
         self.TabPageA3.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
@@ -241,6 +602,7 @@ class QDysmalPyGUI(QMainWindow):
         self.TabPageB5.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
         self.TabPageB6.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
         self.TabPageB7.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
+        self.TabPageB8.setSizePolicy(QSizePolicy.MinimumExpanding, QSizePolicy.Preferred) # this is needed otherwise labels will be partially hidden
         self.ScrollAreaForTabPageA1 = QScrollArea(self)
         self.ScrollAreaForTabPageA2 = QScrollArea(self)
         self.ScrollAreaForTabPageA3 = QScrollArea(self)
@@ -253,6 +615,7 @@ class QDysmalPyGUI(QMainWindow):
         self.ScrollAreaForTabPageB5 = QScrollArea(self)
         self.ScrollAreaForTabPageB6 = QScrollArea(self)
         self.ScrollAreaForTabPageB7 = QScrollArea(self)
+        self.ScrollAreaForTabPageB8 = QScrollArea(self)
         self.ScrollAreaForTabPageA1.setWidgetResizable(True)
         self.ScrollAreaForTabPageA2.setWidgetResizable(True)
         self.ScrollAreaForTabPageA3.setWidgetResizable(True)
@@ -265,6 +628,7 @@ class QDysmalPyGUI(QMainWindow):
         self.ScrollAreaForTabPageB5.setWidgetResizable(True)
         self.ScrollAreaForTabPageB6.setWidgetResizable(True)
         self.ScrollAreaForTabPageB7.setWidgetResizable(True)
+        self.ScrollAreaForTabPageB8.setWidgetResizable(True)
         self.ScrollAreaForTabPageA1.setWidget(self.TabPageA1)
         self.ScrollAreaForTabPageA2.setWidget(self.TabPageA2)
         self.ScrollAreaForTabPageA3.setWidget(self.TabPageA3)
@@ -277,6 +641,7 @@ class QDysmalPyGUI(QMainWindow):
         self.ScrollAreaForTabPageB5.setWidget(self.TabPageB5)
         self.ScrollAreaForTabPageB6.setWidget(self.TabPageB6)
         self.ScrollAreaForTabPageB7.setWidget(self.TabPageB7)
+        self.ScrollAreaForTabPageB8.setWidget(self.TabPageB8)
         self.LabelForLineEditParamFile = QLabel(self.tr('Param File:'))
         self.ButtonForLineEditParamFile = QPushButton(self.tr('...'))
         self.ButtonForLineEditParamFile.setToolTip('Open a param file')
@@ -335,7 +700,7 @@ class QDysmalPyGUI(QMainWindow):
                     isdatafile=True, namefilter=self.tr('FITS file (*.fits *.fits.gz)'), defaultdir=self.DefaultDirectory, enabled=False)
         self.LineEditDataParamsDict['fdata_mask'] = QWidgetForParamInput(\
                     keyname=self.tr('fdata_mask'),
-                    keycomment=self.tr('2D or 3D mask data file.'),
+                    keycomment=self.tr('2D or 3D mask data file. 1 for good pixels.'),
                     datatype=str,
                     fullwidth=True,
                     isdatafile=True, namefilter=self.tr('FITS file (*.fits *.fits.gz)'), defaultdir=self.DefaultDirectory, enabled=False)
@@ -366,7 +731,8 @@ class QDysmalPyGUI(QMainWindow):
         self.LineEditDataParamsDict['symmetrize_data'] = QWidgetForParamInput(\
                     keyname=self.tr('symmetrize_data'),
                     keycomment=self.tr('Symmetrize data before fitting?'),
-                    datatype=bool)
+                    datatype=bool,
+                    default=False)
         self.LineEditDataParamsDict['slit_width'] = QWidgetForParamInput(\
                     keyname=self.tr('slit_width'),
                     keycomment=self.tr('arcsecs'),
@@ -380,22 +746,32 @@ class QDysmalPyGUI(QMainWindow):
                     keycomment=self.tr('Default 1D aperture extraction shape'),
                     datatype=str,
                     options=['circ_ap_cube', 'rect_ap_cube', 'square_ap_cube', 'circ_ap_pv', 'single_pix_pv'],
-                    default='circ_ap_pv')
+                    default='rect_ap_cube')
         self.LineEditDataParamsDict['aperture_radius'] = QWidgetForParamInput(\
                     keyname=self.tr('aperture_radius'),
                     keycomment=self.tr('Circular aperture radius, in ARCSEC. Have used half slit width in past'),
                     datatype=float,
                     default=0.2)
+        self.LineEditDataParamsDict['pix_parallel'] = QWidgetForParamInput(\
+                    keyname=self.tr('pix_parallel'),
+                    keycomment=self.tr('Rectangle aperture size in parallel direction of the pseudo slit, in pixels.'),
+                    datatype=float,
+                    default=1)
+        self.LineEditDataParamsDict['pix_perp'] = QWidgetForParamInput(\
+                    keyname=self.tr('pix_perp'),
+                    keycomment=self.tr('Rectangle aperture size in perpendicular direction of the pseudo slit, i.e., slit width, in pixels.'),
+                    datatype=float,
+                    default=10.)
         self.LineEditDataParamsDict['smoothing_type'] = QWidgetForParamInput(\
                     keyname=self.tr('smoothing_type'),
                     keycomment=self.tr('Is the data median smoothed before extracting maps?'),
                     datatype=str,
-                    options=['median'])
+                    options=['None', 'median'])
         self.LineEditDataParamsDict['smoothing_npix'] = QWidgetForParamInput(\
                     keyname=self.tr('smoothing_npix'),
                     keycomment=self.tr('Number of pixels for smoothing aperture'),
                     datatype=float,
-                    default=3.0)
+                    default=1.0)
         self.LineEditDataParamsDict['xcenter'] = QWidgetForParamInput(\
                     keyname=self.tr('xcenter'),
                     keycomment=self.tr('Galaxy center in pixel coordinate, starting from 0 to NX-1. Need +1 for QFitsView. None means using image center.'),
@@ -450,7 +826,7 @@ class QDysmalPyGUI(QMainWindow):
                     keyname=self.tr('psf_type'),
                     keycomment=self.tr('PSF type, Gaussian or Moffat or DoubleGaussian.'),
                     datatype=str,
-                    options=['Gaussian','Moffat', 'DoubleGaussian'])
+                    options=['Gaussian', 'Moffat', 'DoubleGaussian'])
         self.LineEditDataParamsDict['psf_fwhm'] = QWidgetForParamInput(\
                     keyname=self.tr('psf_fwhm'),
                     keycomment=self.tr('PSF FWHM in arcsecs'),
@@ -458,6 +834,18 @@ class QDysmalPyGUI(QMainWindow):
         self.LineEditDataParamsDict['psf_beta'] = QWidgetForParamInput(\
                     keyname=self.tr('psf_beta'),
                     keycomment=self.tr('Beta parameter for a Moffat PSF'),
+                    datatype=float)
+        self.LineEditDataParamsDict['psf_fwhm_major'] = QWidgetForParamInput( \
+                    keyname=self.tr('psf_fwhm_major'),
+                    keycomment=self.tr('If using an elliptical PSF, set here the PSF major axis FWHM in arcsecs'),
+                    datatype=float)
+        self.LineEditDataParamsDict['psf_fwhm_minor'] = QWidgetForParamInput( \
+                    keyname=self.tr('psf_fwhm_minor'),
+                    keycomment=self.tr('If using an elliptical PSF, set here the PSF minor axis FWHM in arcsecs'),
+                    datatype=float)
+        self.LineEditDataParamsDict['psf_PA'] = QWidgetForParamInput( \
+                    keyname=self.tr('psf_PA'),
+                    keycomment=self.tr('If using an elliptical PSF, set here the PSF position angle in degrees'),
                     datatype=float)
         #
         #self.LineEditInstrumentParamsDict = OrderedDict()
@@ -581,6 +969,65 @@ class QDysmalPyGUI(QMainWindow):
                     keyname=self.tr('NULL'),
                     keycomment=self.tr(""))
         #
+        self.LineEditModelParamsDictForDarkMatterHalo = OrderedDict()
+        self.LineEditModelParamsDictForDarkMatterHalo['include_halo'] = QWidgetForParamInput(\
+                    keyname=self.tr('include_halo'),
+                    keycomment=self.tr("Include a halo?"),
+                    #associatedparams=['halo_profile_type', 'mvirial', 'mvirial_fixed', 'halo_conc', 'halo_conc_fixed', 'fdm', 'fdm_fixed'],
+                    datatype=bool,
+                    default=True)
+        self.LineEditModelParamsDictForDarkMatterHalo['include_halo_NULL'] = QWidgetForParamInput(\
+                    keyname=self.tr('NULL'),
+                    keycomment=self.tr(""))
+        self.LineEditModelParamsDictForDarkMatterHalo['halo_profile_type'] = QWidgetForParamInput(\
+                    keyname=self.tr('halo_profile_type'),
+                    keycomment=self.tr("Halo type"),
+                    datatype=str,
+                    options=['NFW', 'twopowerhalo', 'burkert', 'einasto', 'dekelzhao'])
+        self.LineEditModelParamsDictForDarkMatterHalo['halo_profile_type_NULL'] = QWidgetForParamInput(\
+                    keyname=self.tr('NULL'),
+                    keycomment=self.tr(""))
+        self.LineEditModelParamsDictForDarkMatterHalo['mvirial'] = QWidgetForParamInput(\
+                    keyname=self.tr('mvirial'),
+                    keycomment=self.tr("Halo virial mass in log(Msun)"),
+                    datatype=float)
+        self.LineEditModelParamsDictForDarkMatterHalo['mvirial_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('mvirial_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        self.LineEditModelParamsDictForDarkMatterHalo['halo_conc'] = QWidgetForParamInput(\
+                    keyname=self.tr('halo_conc'),
+                    keycomment=self.tr("Halo concentration parameter"),
+                    datatype=float)
+        self.LineEditModelParamsDictForDarkMatterHalo['halo_conc_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('halo_conc_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        self.LineEditModelParamsDictForDarkMatterHalo['alpha'] = QWidgetForParamInput(\
+                    keyname=self.tr('alpha'),
+                    keycomment=self.tr("Halo alpha parameter for the twopowerhalo type, default is 1."),
+                    datatype=float, default=1.0)
+        self.LineEditModelParamsDictForDarkMatterHalo['alpha_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('alpha_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        self.LineEditModelParamsDictForDarkMatterHalo['beta'] = QWidgetForParamInput(\
+                    keyname=self.tr('beta'),
+                    keycomment=self.tr("Halo beta parameter for the twopowerhalo type, default is 3."),
+                    datatype=float, default=3.0)
+        self.LineEditModelParamsDictForDarkMatterHalo['beta_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('beta_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        self.LineEditModelParamsDictForDarkMatterHalo['fdm'] = QWidgetForParamInput(\
+                    keyname=self.tr('fdm'),
+                    keycomment=self.tr("Dark matter fraction at Reff"),
+                    datatype=float)
+        self.LineEditModelParamsDictForDarkMatterHalo['fdm_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('fdm_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        #
         self.LineEditModelParamsDictForDispersion = OrderedDict()
         self.LineEditModelParamsDictForDispersion['sigma0'] = QWidgetForParamInput(\
                     keyname=self.tr('sigma0'),
@@ -588,16 +1035,6 @@ class QDysmalPyGUI(QMainWindow):
                     datatype=float)
         self.LineEditModelParamsDictForDispersion['sigma0_fixed'] = QWidgetForParamInput(\
                     keyname=self.tr('sigma0_fixed'),
-                    keycomment=self.tr(""),
-                    datatype=bool)
-        #
-        self.LineEditModelParamsDictForZHeight = OrderedDict()
-        self.LineEditModelParamsDictForZHeight['sigmaz'] = QWidgetForParamInput(\
-                    keyname=self.tr('sigmaz'),
-                    keycomment=self.tr("Gaussian width of the galaxy in z"),
-                    datatype=float)
-        self.LineEditModelParamsDictForZHeight['sigmaz_fixed'] = QWidgetForParamInput(\
-                    keyname=self.tr('sigmaz_fixed'),
                     keycomment=self.tr(""),
                     datatype=bool)
         #
@@ -646,39 +1083,75 @@ class QDysmalPyGUI(QMainWindow):
                     keycomment=self.tr(""),
                     datatype=bool)
         #
-        self.LineEditModelParamsDictForDarkMatterHalo = OrderedDict()
-        self.LineEditModelParamsDictForDarkMatterHalo['halo_profile_type'] = QWidgetForParamInput(\
-                    keyname=self.tr('halo_profile_type'),
-                    keycomment=self.tr("Halo type"),
-                    datatype=str,
-                    options=['NFW', 'twopowerhalo', 'burkert', 'einasto', 'dekelzhao'])
-        self.LineEditModelParamsDictForDarkMatterHalo['halo_profile_type_NULL'] = QWidgetForParamInput(\
+        self.LineEditModelParamsDictForZHeight = OrderedDict()
+        self.LineEditModelParamsDictForZHeight['sigmaz'] = QWidgetForParamInput(\
+                    keyname=self.tr('sigmaz'),
+                    keycomment=self.tr("Gaussian width of the galaxy in z-direction"),
+                    datatype=float)
+        self.LineEditModelParamsDictForZHeight['sigmaz_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('sigmaz_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool)
+        #
+        self.LineEditModelParamsDictForNonCirc = OrderedDict()
+        self.LineEditModelParamsDictForNonCirc['include_uniform_planar_radial_flow'] = QWidgetForParamInput(\
+                    keyname=self.tr('include_uniform_planar_radial_flow'),
+                    keycomment=self.tr("enable uniform_planar_radial_flow?"),
+                    associatedparams=['vr', 'vr_fixed'],
+                    datatype=bool, 
+                    default=False)
+        self.LineEditModelParamsDictForNonCirc['include_uniform_planar_radial_flow_NULL'] = QWidgetForParamInput(\
                     keyname=self.tr('NULL'),
                     keycomment=self.tr(""))
-        self.LineEditModelParamsDictForDarkMatterHalo['mvirial'] = QWidgetForParamInput(\
-                    keyname=self.tr('mvirial'),
-                    keycomment=self.tr("Halo virial mass in log(Msun)"),
-                    datatype=float)
-        self.LineEditModelParamsDictForDarkMatterHalo['mvirial_fixed'] = QWidgetForParamInput(\
-                    keyname=self.tr('mvirial_fixed'),
+        self.LineEditModelParamsDictForNonCirc['vr'] = QWidgetForParamInput(\
+                    keyname=self.tr('vr'),
+                    keycomment=self.tr("Radial flow velocity [km/s]. Positive: Outflow. Negative: Inflow."),
+                    datatype=float, 
+                    default=30.0, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['vr_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('vr_fixed'),
                     keycomment=self.tr(""),
-                    datatype=bool)
-        self.LineEditModelParamsDictForDarkMatterHalo['halo_conc'] = QWidgetForParamInput(\
-                    keyname=self.tr('halo_conc'),
-                    keycomment=self.tr("Halo concentration parameter"),
-                    datatype=float)
-        self.LineEditModelParamsDictForDarkMatterHalo['halo_conc_fixed'] = QWidgetForParamInput(\
-                    keyname=self.tr('halo_conc_fixed'),
+                    datatype=bool, 
+                    default=False, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['include_uniform_bar_flow'] = QWidgetForParamInput(\
+                    keyname=self.tr('include_uniform_bar_flow'),
+                    keycomment=self.tr("enable uniform_bar_flow?"),
+                    associatedparams=['vbar', 'vbar_fixed', 'phi', 'phi_fixed', 'bar_width', 'bar_width_fixed'],
+                    datatype=bool, 
+                    default=False)
+        self.LineEditModelParamsDictForNonCirc['include_uniform_bar_flow_NULL'] = QWidgetForParamInput(\
+                    keyname=self.tr('NULL'),
+                    keycomment=self.tr(""))
+        self.LineEditModelParamsDictForNonCirc['vbar'] = QWidgetForParamInput(\
+                    keyname=self.tr('vbar'),
+                    keycomment=self.tr("Bar flow velocity [km/s]. Positive: Outflow. Negative: Inflow."),
+                    datatype=float, 
+                    default=-90.0, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['vbar_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('vbar_fixed'),
                     keycomment=self.tr(""),
-                    datatype=bool)
-        self.LineEditModelParamsDictForDarkMatterHalo['fdm'] = QWidgetForParamInput(\
-                    keyname=self.tr('fdm'),
-                    keycomment=self.tr("Dark matter fraction at Reff"),
-                    datatype=float)
-        self.LineEditModelParamsDictForDarkMatterHalo['fdm_fixed'] = QWidgetForParamInput(\
-                    keyname=self.tr('fdm_fixed'),
+                    datatype=bool, 
+                    default=False, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['phi'] = QWidgetForParamInput(\
+                    keyname=self.tr('phi'),
+                    keycomment=self.tr("Azimuthal angle of bar [degrees], counter-clockwise from blue major axis. Default is 90 (eg, along galaxy minor axis)."),
+                    datatype=float, 
+                    default=90.0, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['phi_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('phi_fixed'),
                     keycomment=self.tr(""),
-                    datatype=bool)
+                    datatype=bool, 
+                    default=True, enabled=False) # in default this is fixed
+        self.LineEditModelParamsDictForNonCirc['bar_width'] = QWidgetForParamInput(\
+                    keyname=self.tr('bar_width'),
+                    keycomment=self.tr("Width of the bar perpendicular to bar direction, in pixels. Bar velocity only is nonzero between -bar_width/2 < ygal < bar_width/2."),
+                    datatype=float, 
+                    default=5.0, enabled=False)
+        self.LineEditModelParamsDictForNonCirc['bar_width_fixed'] = QWidgetForParamInput(\
+                    keyname=self.tr('bar_width_fixed'),
+                    keycomment=self.tr(""),
+                    datatype=bool, 
+                    default=True, enabled=False) # in default this is fixed
         #
         initial_param_bounds = {}
         initial_param_bounds['total_mass']   = [9.0, 13.0]
@@ -690,10 +1163,15 @@ class QDysmalPyGUI(QMainWindow):
         initial_param_bounds['sigma0']       = [5.0, 300.0]
         initial_param_bounds['sigmaz']       = [0.1, 1.0]
         initial_param_bounds['inc']          = [0.0, 90.0]
-        initial_param_bounds['pa']           = [-180.0, 180.0]
+        initial_param_bounds['pa']           = [-180.0, 360.0] # pa_bounds
         initial_param_bounds['mvirial']      = [9.0, 14.0]
         initial_param_bounds['halo_conc']    = [1.0, 20.0]
+        initial_param_bounds['alpha']        = [0.0, 1.0]
+        initial_param_bounds['beta']         = [2.0, 3.0]
         initial_param_bounds['fdm']          = [0.0, 0.99]
+        initial_param_bounds['xshift']       = [-10.0, 10.0]
+        initial_param_bounds['yshift']       = [-10.0, 10.0]
+        initial_param_bounds['vel_shift']    = [-50.0, 50.0]
         initial_param_stddev = {}
         initial_param_stddev['total_mass']   = 1.0
         initial_param_stddev['bt']           = 0.1
@@ -707,12 +1185,18 @@ class QDysmalPyGUI(QMainWindow):
         initial_param_stddev['pa']           = 0.1
         initial_param_stddev['mvirial']      = 0.5
         initial_param_stddev['halo_conc']    = 0.5
+        initial_param_stddev['alpha']        = 0.1
+        initial_param_stddev['beta']         = 0.1
         initial_param_stddev['fdm']          = 1.0
+        initial_param_stddev['xshift']       = 3.0
+        initial_param_stddev['yshift']       = 3.0
+        initial_param_stddev['vel_shift']    = 10.0
         #
         self.LineEditModelParamsDictForLimits = OrderedDict()
         for key in ['total_mass', 'bt', 'r_eff_disk', 'n_disk', 'r_eff_bulge', 'n_bulge',
                     'sigma0', 'sigmaz', 'inc', 'pa',
-                    'mvirial', 'halo_conc', 'fdm']:
+                    'mvirial', 'halo_conc', 'alpha', 'beta', 'fdm', 
+                    'xshift', 'yshift', 'vel_shift']:
             self.LineEditModelParamsDictForLimits[key+'_bounds'] = QWidgetForParamInput(\
                     keyname=self.tr(key+'_bounds'),
                     keycomment=self.tr(""),
@@ -764,7 +1248,7 @@ class QDysmalPyGUI(QMainWindow):
                     keyname=self.tr('oversample'),
                     keycomment=self.tr("Oversampling the model cube"),
                     datatype=int,
-                    default=3)
+                    default=1)
         self.LineEditModelParamsDictForFitting['oversize'] = QWidgetForParamInput(\
                     keyname=self.tr('oversize'),
                     keycomment=self.tr("Oversize of the model cube"),
@@ -821,12 +1305,13 @@ class QDysmalPyGUI(QMainWindow):
                     datatype=bool,
                     default='False')
         #
-        self.LineEditModelParamsDicts = []
+        self.LineEditModelParamsDicts = [] # each element is a dict corresponding to a 'self.TabPageB*'
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForBulgeDisk)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForDarkMatterHalo)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForDispersion)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForGeometry)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForZHeight)
+        self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForNonCirc)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForLimits)
         self.LineEditModelParamsDicts.append(self.LineEditModelParamsDictForFitting)
         #
@@ -844,15 +1329,17 @@ class QDysmalPyGUI(QMainWindow):
         self.TabWidgetB.addTab(self.ScrollAreaForTabPageB3, self.tr('Disp'))
         self.TabWidgetB.addTab(self.ScrollAreaForTabPageB4, self.tr('Geometry'))
         self.TabWidgetB.addTab(self.ScrollAreaForTabPageB5, self.tr('ZHeight'))
-        self.TabWidgetB.addTab(self.ScrollAreaForTabPageB6, self.tr('Limits'))
-        self.TabWidgetB.addTab(self.ScrollAreaForTabPageB7, self.tr('Fitting'))
+        self.TabWidgetB.addTab(self.ScrollAreaForTabPageB6, self.tr('NonCirc'))
+        self.TabWidgetB.addTab(self.ScrollAreaForTabPageB7, self.tr('Limits'))
+        self.TabWidgetB.addTab(self.ScrollAreaForTabPageB8, self.tr('Fitting'))
         self.TabWidgetB.setTabToolTip(0, self.tr('Disk+Bulge model parameters'))
         self.TabWidgetB.setTabToolTip(1, self.tr('Halo model parameters'))
         self.TabWidgetB.setTabToolTip(2, self.tr('Dispersion profile parameters'))
         self.TabWidgetB.setTabToolTip(3, self.tr('Geometric parameters'))
         self.TabWidgetB.setTabToolTip(4, self.tr('Z-direction parameters'))
-        self.TabWidgetB.setTabToolTip(5, self.tr('All parameter limits'))
-        self.TabWidgetB.setTabToolTip(6, self.tr('Parameters related to the fitting'))
+        self.TabWidgetB.setTabToolTip(5, self.tr('Non-circular motion parameters'))
+        self.TabWidgetB.setTabToolTip(6, self.tr('All parameter limits'))
+        self.TabWidgetB.setTabToolTip(7, self.tr('Parameters related to the fitting'))
         #
         self.TabWidgetA.setStyleSheet("""
             QTabWidget::tab-bar {
@@ -1033,12 +1520,12 @@ class QDysmalPyGUI(QMainWindow):
         self.LabelComponents = QLabel(self.tr("Components"))
         #
         self.CheckBoxModelParamsDict = OrderedDict()
-        self.CheckBoxModelParamsDict['include_halo'] = QWidgetForParamInput(\
-                     keyname=self.tr("include_halo"),
-                     keycomment=self.tr("Include the halo as a component in fitting?"),
-                     datatype=bool,
-                     checkbox=True,
-                     default='True')
+        #self.CheckBoxModelParamsDict['include_halo'] = QWidgetForParamInput(\
+        #             keyname=self.tr("include_halo"),
+        #             keycomment=self.tr("Include the halo as a component in fitting?"),
+        #             datatype=bool,
+        #             checkbox=True,
+        #             default='True')
         self.CheckBoxModelParamsDict['adiabatic_contract'] = QWidgetForParamInput(\
                      keyname=self.tr("adiabatic_contract"),
                      keycomment=self.tr("Apply adiabatic contraction?"),
@@ -1083,6 +1570,18 @@ class QDysmalPyGUI(QMainWindow):
         self.CheckBoxModelParamsDict['zcalc_truncate'] = QWidgetForParamInput(\
                      keyname=self.tr('zcalc_truncate'),
                      keycomment=self.tr("If True, the cube is only filled with flux to within +- 2 * scale length thickness above and below the galaxy midplane"),
+                     datatype=bool,
+                     checkbox=True,
+                     default='True')
+        self.CheckBoxModelParamsDict['zcalc_with_c'] = QWidgetForParamInput( \
+                    keyname=self.tr('zcalc_with_c'),
+                    keycomment=self.tr("If True, the cube is populated with c++ code."),
+                    datatype=bool,
+                    checkbox=True,
+                    default='False')
+        self.CheckBoxModelParamsDict['partial_weight'] = QWidgetForParamInput(\
+                     keyname=self.tr('partial_weight'),
+                     keycomment=self.tr("If True, do partial weight when dealing with aperture inner pixels."),
                      datatype=bool,
                      checkbox=True,
                      default='True')
@@ -1363,11 +1862,16 @@ class QDysmalPyGUI(QMainWindow):
         #
         # set main window geometry size to 95% x 85% of the screen size
         if ScreenSize is not None:
-            self.setGeometry(ScreenSize.width() * (1.0-0.95)/2.0, ScreenSize.height() * (1.0-0.85)/2.0,
-                             ScreenSize.width() * 0.95, ScreenSize.height() * 0.85)
+            self.setGeometry(int(ScreenSize.width() * (1.0-0.95)/2.0), 
+                             int(ScreenSize.height() * (1.0-0.85)/2.0), 
+                             int(ScreenSize.width() * 0.95), 
+                             int(ScreenSize.height() * 0.85) )
             # make it centered on screen, 75% screen width and 85% screen height.
         #self.setWindowTitle('Icon')
         #self.setWindowIcon(QIcon('web.png'))
+        self.setWindowTitle("DysmalPy - 3D Forward Modeling & Kinematic Fitting - MPE IR Group")
+        #self.setWindowIcon(getIconDysmalPy())
+        # 
         self.SplitterForCentralWidget.setSizes([9, 1, 9])
         #
         self.setButtonsEnabledDisabled()
@@ -1430,18 +1934,24 @@ class QDysmalPyGUI(QMainWindow):
         elif keyvalue == 'inf':
             keyvalue = np.inf
         else:
+            if keyname not in self.DysmalPyParams:
+                self.DysmalPyParams[keyname] = None
             if listtype is list:
                 try:
                     keyvalue = eval(keyvalue)
                     keyvalue = np.array(keyvalue).astype(datatype)
                 except:
-                    self.logMessage(self.tr('Could not update DysmalPyParams key ')+str(keyname)+self.tr(' value ')+'"'+str(keyvalue)+'"'+self.tr(' as type ')+str(datatype)+self.tr('. Current value '+str(self.DysmalPyParams[keyname])))
+                    self.logMessage(self.tr('Could not update DysmalPyParams key ')+str(keyname)+
+                                    self.tr(' value ')+'"'+str(keyvalue)+'"'+self.tr(' as type ')+str(datatype)+
+                                    self.tr('. Current value '+str(self.DysmalPyParams[keyname])))
                     return
             else:
                 try:
                     keyvalue = np.array([keyvalue]).astype(datatype)[0]
                 except:
-                    self.logMessage(self.tr('Could not update DysmalPyParams key ')+str(keyname)+self.tr(' value ')+'"'+str(keyvalue)+'"'+self.tr(' as type ')+str(datatype)+self.tr('. Current value '+str(self.DysmalPyParams[keyname])))
+                    self.logMessage(self.tr('Could not update DysmalPyParams key ')+str(keyname)+
+                                    self.tr(' value ')+'"'+str(keyvalue)+'"'+self.tr(' as type ')+str(datatype)+
+                                    self.tr('. Current value '+str(self.DysmalPyParams[keyname])))
                     return
         
         # for data related keys, if keyvalue is set to None, then we delete the key in the dict DysmalPyParams
@@ -1455,9 +1965,56 @@ class QDysmalPyGUI(QMainWindow):
              keyvalue != self.DysmalPyParams[keyname]:
             self.clearLensingTransformer()
             self.logMessage(self.tr('Cleared DysmalPyFittingTower lensing_transformer due to changing key ')+str(keyname))
+        # for additional component -- non-circular motion keys, manipulate the 'components_list'
+        elif keyname.startswith('include_'):
+            addcomponent = keyname.replace('include_', '')
+            if keyvalue == True:
+                self.logMessage(self.tr('Enabling component ')+str(addcomponent))
+                if 'components_list' not in self.DysmalPyParams:
+                    self.DysmalPyParams['components_list'] = ['disk+bulge', 'const_disp_prof', 'geometry', 'zheight_gaus']
+                    if self.DysmalPyParams['include_halo']:
+                        self.DysmalPyParams['components_list'].append('halo')
+                if addcomponent not in self.DysmalPyParams['components_list']:
+                    self.DysmalPyParams['components_list'].append(addcomponent)
+                self.logMessage(self.tr('Updated DysmalPyParams key ')+str('components_list')+
+                                self.tr(' value ')+str(self.DysmalPyParams['components_list'])+self.tr(' type ')+str('list'))
+            else:
+                self.logMessage(self.tr('Disabling component ')+str(addcomponent))
+                if 'components_list' in self.DysmalPyParams:
+                    if addcomponent in self.DysmalPyParams['components_list']:
+                        self.DysmalPyParams['components_list'].remove(addcomponent)
+                    self.logMessage(self.tr('Updated DysmalPyParams key ')+str('components_list')+
+                                    self.tr(' value ')+str(self.DysmalPyParams['components_list'])+self.tr(' type ')+str('list'))
+            #print('self.LineEditModelParamsDictForNonCirc[keyname].AssociatedParams', self.LineEditModelParamsDictForNonCirc[keyname].AssociatedParams)
+            if keyname in self.LineEditModelParamsDictForNonCirc:
+                associatedparams = self.LineEditModelParamsDictForNonCirc[keyname].AssociatedParams
+                if associatedparams is not None:
+                    for associatedkeyname in associatedparams:
+                        self.LineEditModelParamsDictForNonCirc[associatedkeyname].setEnabled(keyvalue)
+                        if keyvalue == True:
+                            associatedkeyvalue = self.LineEditModelParamsDictForNonCirc[associatedkeyname].keyvalue()
+                            associateddatatype = self.LineEditModelParamsDictForNonCirc[associatedkeyname].dataType()
+                            self.DysmalPyParams[associatedkeyname] = associatedkeyvalue
+                            self.logMessage(self.tr('Updated DysmalPyParams key ')+str(associatedkeyname)+
+                                            self.tr(' value ')+str(associatedkeyvalue)+self.tr(' type ')+str(associateddatatype))
+                        else:
+                            if associatedkeyname in self.DysmalPyParams:
+                                del self.DysmalPyParams[associatedkeyname]
+                                self.logMessage(self.tr('Deleted DysmalPyParams key ')+str(associatedkeyname))
         else:
+            
+            # for data dir out dir ensure ending with slash
+            if keyname in ['datadir', 'outdir']:
+                if keyvalue is not None:
+                    keyvalue = ensure_path_trailing_slash(keyvalue)
+            
             self.DysmalPyParams[keyname] = keyvalue
-            self.logMessage(self.tr('Updated DysmalPyParams key ')+str(keyname)+self.tr(' value ')+str(keyvalue)+self.tr(' type ')+str(datatype))
+            self.logMessage(self.tr('Updated DysmalPyParams key ')+str(keyname)+
+                            self.tr(' value ')+str(keyvalue)+self.tr(' type ')+str(datatype))
+        # 
+        # for oversample key, also update self.CheckBoxModelParamsDict['__oversampling__']
+        if keyname == 'oversample':
+            self.CheckBoxModelParamsDict['__oversampling__'].setChecked(keyvalue>1, blocksignal=True)
     
     @pyqtSlot(int)
     def onGaussExtractCheckStateChangedCall(self, state):
@@ -1668,6 +2225,10 @@ class QDysmalPyGUI(QMainWindow):
             #msgBox.buttonClicked.connect(msgButtonClick)
             msgBox.exec()
             return
+        # 
+        if 'oversample' in params:
+            if params['oversample'] is None or str(params['oversample']) == 'None':
+                params['oversample'] = 1 # a simple fix, 20230804
         #
         self.DysmalPyParamFile = filepath
         self.DysmalPyParams = params
@@ -1679,11 +2240,11 @@ class QDysmalPyGUI(QMainWindow):
         if 'datadir' not in self.DysmalPyParams:
             self.DysmalPyParams['datadir'] = None
         if self.DysmalPyParams['datadir'] is not None and self.DysmalPyParams['datadir'] != '':
-            self.DysmalPyParams['datadir'] = utils_io.ensure_path_trailing_slash(self.DysmalPyParams['datadir'])
+            self.DysmalPyParams['datadir'] = ensure_path_trailing_slash(self.DysmalPyParams['datadir'])
         if 'outdir' not in self.DysmalPyParams:
             self.DysmalPyParams['outdir'] = None
         if self.DysmalPyParams['outdir'] is not None and self.DysmalPyParams['outdir'] != '':
-            self.DysmalPyParams['outdir'] = utils_io.ensure_path_trailing_slash(self.DysmalPyParams['outdir'])
+            self.DysmalPyParams['outdir'] = ensure_path_trailing_slash(self.DysmalPyParams['outdir'])
         #
         #self.logger.debug("self.DysmalPyParams['datadir']: "+str(self.DysmalPyParams['datadir']))
         #self.logger.debug("self.DysmalPyParams['outdir']: "+str(self.DysmalPyParams['outdir']))
@@ -1759,6 +2320,9 @@ class QDysmalPyGUI(QMainWindow):
             if (self.DysmalPyParams['fitflux']):
                 if not ('fdata_flux' in self.DysmalPyParams and 'fdata_ferr' in self.DysmalPyParams):
                     errormessages.append('No fdata_flux and fdata_ferr keys when fitflux is set!')
+        # 
+        if ('galID' in self.DysmalPyParams):
+            self.DysmalPyParams['galID'] = str(self.DysmalPyParams['galID'])
         #
         if len(errormessages) > 0:
             self.logMessage(self.tr('Found errors in the Dysmal param file: ')+str(filepath))
@@ -1788,20 +2352,21 @@ class QDysmalPyGUI(QMainWindow):
                 self.fitDataAsync(doFit=False, clearFitResults=False)
         self.setButtonsEnabledDisabled()
     
-    def writeOneLineToParamFile(self, fp, keyname, keyvalue, keycomment, datatype, listtype,
-                                ensure_path_trailing_slash = False):
+    def writeOneLineToParamFile(self, fp, keyname, keyvalue, keycomment, datatype, listtype):
         if keyname.find('NULL')>=0 or keyname.startswith('__'):
             return
         if keycomment is None:
             keycomment = ''
-        if ensure_path_trailing_slash:
-            if not keyvalue.endswith(os.sep):
-                keyvalue += os.sep
+        #ensure_path_trailing_slash:
+        #if not keyvalue.endswith(os.sep):
+        #    keyvalue += os.sep
         if keyvalue == '' and datatype in [int, float] and listtype is not list:
             keyvalue = 'None'
         if listtype is list:
             #keyvalue = re.sub(r'[, ]+', r' ', re.sub(r'^\[(.*)\]$', r'\1', str(keyvalue).strip()))
-            keyvalue = ' '.join([str(t) for t in eval(keyvalue)])
+            #keyvalue = ' '.join([str(t) for t in eval(str(keyvalue))])
+            #keyvalue = ' '.join([str(t) for t in (re.sub(r'[\[\],]', r' ', str(keyvalue))).strip().split()])
+            keyvalue = ' '.join([str(t) for t in (re.sub(r'[\[\]\'\",]', r' ', str(keyvalue))).strip().split()])
         if keycomment.strip() != '':
             fp.write('{:<26} {:<62} {} {} \n'.format(keyname+',', keyvalue, '#', keycomment))
         else:
@@ -1865,6 +2430,14 @@ class QDysmalPyGUI(QMainWindow):
                                                  self.CheckBoxModelParamsDict[key].dataType(),\
                                                  self.CheckBoxModelParamsDict[key].listType()\
                                                  )
+            if 'components_list' in self.DysmalPyParams:
+                key = 'components_list'
+                self.writeOneLineToParamFile(fp, key, \
+                                             self.DysmalPyParams[key],\
+                                             '',\
+                                             str,\
+                                             list\
+                                             )
         self.logMessage(self.tr('Saved parameters to param file: ')+str(filepath))
     
     @pyqtSlot()
@@ -2108,9 +2681,9 @@ class QDysmalPyGUI(QMainWindow):
     def plotDataMomentMaps(self):
         self.logMessage(self.tr('Computing and displaying data cube moment maps'))
         if self.DysmalPyFittingTower.data_flux_map is not None:
-            self.ImageViewerA1.showImage(self.DysmalPyFittingTower.data_flux_map, with_colorbar=True)
+            self.ImageViewerA1.showImage(self.DysmalPyFittingTower.data_flux_map, with_colorbar=True, cmap='viridis')
         if self.DysmalPyFittingTower.data_vel_map is not None:
-            self.ImageViewerA2.showImage(self.DysmalPyFittingTower.data_vel_map, with_colorbar=True, cmap='RdYlBu_r')
+            self.ImageViewerA2.showImage(self.DysmalPyFittingTower.data_vel_map, with_colorbar=True) # , cmap='RdYlBu_r'
         if self.DysmalPyFittingTower.data_disp_map is not None:
             self.ImageViewerA3.showImage(self.DysmalPyFittingTower.data_disp_map, with_colorbar=True, cmap='plasma')
         self.logMessage(self.tr('Successfully computed and displayed data cube moment maps'))
@@ -2118,17 +2691,17 @@ class QDysmalPyGUI(QMainWindow):
     def plotModelMomentMaps(self):
         self.logMessage(self.tr('Computing and displaying model cube moment maps'))
         if self.DysmalPyFittingTower.model_flux_map is not None:
-            self.ImageViewerB1.showImage(self.DysmalPyFittingTower.model_flux_map, with_colorbar=True)
+            self.ImageViewerB1.showImage(self.DysmalPyFittingTower.model_flux_map, with_colorbar=True, cmap='viridis')
         if self.DysmalPyFittingTower.model_vel_map is not None:
-            self.ImageViewerB2.showImage(self.DysmalPyFittingTower.model_vel_map, with_colorbar=True, cmap='RdYlBu_r')
+            self.ImageViewerB2.showImage(self.DysmalPyFittingTower.model_vel_map, with_colorbar=True) # , cmap='RdYlBu_r'
         if self.DysmalPyFittingTower.model_disp_map is not None:
             self.ImageViewerB3.showImage(self.DysmalPyFittingTower.model_disp_map, with_colorbar=True, cmap='plasma')
         if self.DysmalPyFittingTower.residual_flux_map is not None:
-            self.ImageViewerC1.showImage(self.DysmalPyFittingTower.residual_flux_map, with_colorbar=True)
+            self.ImageViewerC1.showImage(self.DysmalPyFittingTower.residual_flux_map, with_colorbar=True) # , cmap='RdYlBu_r'
         if self.DysmalPyFittingTower.residual_vel_map is not None:
-            self.ImageViewerC2.showImage(self.DysmalPyFittingTower.residual_vel_map, with_colorbar=True, cmap='RdYlBu_r')
+            self.ImageViewerC2.showImage(self.DysmalPyFittingTower.residual_vel_map, with_colorbar=True) # , cmap='RdYlBu_r'
         if self.DysmalPyFittingTower.residual_disp_map is not None:
-            self.ImageViewerC3.showImage(self.DysmalPyFittingTower.residual_disp_map, with_colorbar=True, cmap='RdYlBu_r')
+            self.ImageViewerC3.showImage(self.DysmalPyFittingTower.residual_disp_map, with_colorbar=True) # , cmap='RdYlBu_r'
         self.logMessage(self.tr('Successfully computed and displayed model cube moment maps'))
     
     def plotModelRotationCurves(self):
@@ -2148,8 +2721,7 @@ class QDysmalPyGUI(QMainWindow):
             has_plot = True
         if has_plot:
             #self.SpecViewerA1.axes.set_title('Flux')
-            self.SpecViewerA1.axes.legend(loc='upper left')
-            self.SpecViewerA1.draw()
+            self.SpecViewerA1.plotLegend(loc='upper left')
             # also show a slit as a line
             if self.DysmalPyFittingTower.data_flux_map is not None:
                 self.ImageViewerA1.showSlit(self.getSlitShapeInPixel())
@@ -2172,8 +2744,9 @@ class QDysmalPyGUI(QMainWindow):
             has_plot = True
         if has_plot:
             #self.SpecViewerA2.axes.set_title('Vel')
-            self.SpecViewerA2.axes.legend(loc='upper left')
-            self.SpecViewerA2.draw()
+            #self.SpecViewerA2.axes.legend(loc='upper left') # 20250827?
+            #self.SpecViewerA2.draw() # 20250827?
+            self.SpecViewerA2.plotLegend(loc='upper left')
             # also show a slit as a line
             if self.DysmalPyFittingTower.data_vel_map is not None:
                 self.ImageViewerA2.showSlit(self.getSlitShapeInPixel())
@@ -2196,8 +2769,9 @@ class QDysmalPyGUI(QMainWindow):
             has_plot = True
         if has_plot:
             #self.SpecViewerA3.axes.set_title('Vdisp')
-            self.SpecViewerA3.axes.legend(loc='upper left')
-            self.SpecViewerA3.draw()
+            #self.SpecViewerA3.axes.legend(loc='upper left') # 20250827?
+            #self.SpecViewerA3.draw() # 20250827?
+            self.SpecViewerA3.plotLegend(loc='upper left')
             # also show a slit as a line
             if self.DysmalPyFittingTower.data_disp_map is not None:
                 self.ImageViewerA3.showSlit(self.getSlitShapeInPixel())
@@ -2326,23 +2900,29 @@ class QDysmalPyGUI(QMainWindow):
         if self.LineEditDataParamsDict['pixscale'].text() == '':
             self.LineEditDataParamsDict['pixscale'].setText('0.05')
         if self.LineEditDataParamsDict['fov_npix'].text() == '':
-            self.LineEditDataParamsDict['fov_npix'].setText('50')
+            self.LineEditDataParamsDict['fov_npix'].setText('100')
         if self.LineEditDataParamsDict['spec_type'].text() == '':
             self.LineEditDataParamsDict['spec_type'].setText('velocity')
         if self.LineEditDataParamsDict['spec_start'].text() == '':
             self.LineEditDataParamsDict['spec_start'].setText('-1000.')
         if self.LineEditDataParamsDict['spec_step'].text() == '':
-            self.LineEditDataParamsDict['spec_step'].setText('25.')
+            self.LineEditDataParamsDict['spec_step'].setText('20.')
         if self.LineEditDataParamsDict['nspec'].text() == '':
-            self.LineEditDataParamsDict['nspec'].setText('80')
+            self.LineEditDataParamsDict['nspec'].setText('100')
         if self.LineEditDataParamsDict['sig_inst_res'].text() == '':
             self.LineEditDataParamsDict['sig_inst_res'].setText('5.')
         if self.LineEditDataParamsDict['psf_fwhm'].text() == '':
-            self.LineEditDataParamsDict['psf_fwhm'].setText('0.3') # arcsec
+            self.LineEditDataParamsDict['psf_fwhm'].setText('0.3') # arcsec # superceded by psf_fwhm_major, psf_fwhm_minor
+        if self.LineEditDataParamsDict['psf_fwhm_major'].text() == '':
+            self.LineEditDataParamsDict['psf_fwhm_major'].setText('0.3') # arcsec
+        if self.LineEditDataParamsDict['psf_fwhm_minor'].text() == '':
+            self.LineEditDataParamsDict['psf_fwhm_minor'].setText('0.3') # arcsec
+        if self.LineEditDataParamsDict['psf_PA'].text() == '':
+            self.LineEditDataParamsDict['psf_PA'].setText('0.0') # degrees
         if self.LineEditDataParamsDict['slit_width'].text() == '':
             self.LineEditDataParamsDict['slit_width'].setText('0.5') # arcsec
-        if self.LineEditDataParamsDict['slit_pa'].text() == '':
-            self.LineEditDataParamsDict['slit_pa'].setText(str(np.round(np.random.uniform(low=0.0, high=180.0, size=(1))[0], 3)))
+        #if self.LineEditDataParamsDict['slit_pa'].text() == '':
+        #    self.LineEditDataParamsDict['slit_pa'].setText(str(np.round(np.random.uniform(low=0.0, high=180.0, size=(1))[0], 3)))
         #
         self.LineEditModelParamsDictForBulgeDisk['total_mass'].setText(str(np.round(np.random.uniform(low=10.0, high=12.0, size=(1))[0], 3)))
         self.LineEditModelParamsDictForBulgeDisk['bt'].setText(str(np.round(np.random.uniform(low=0.0, high=1.0, size=(1))[0], 3)))
@@ -2354,6 +2934,7 @@ class QDysmalPyGUI(QMainWindow):
         self.LineEditModelParamsDictForZHeight['sigmaz'].setText(str(np.round(np.random.uniform(low=0.1, high=0.5, size=(1))[0], 3)))
         self.LineEditModelParamsDictForGeometry['inc'].setText(str(np.round(np.random.uniform(low=15.0, high=65.0, size=(1))[0], 3)))
         self.LineEditModelParamsDictForGeometry['pa'].setText(str(np.round(np.random.uniform(low=-180.0, high=180.0, size=(1))[0], 3)))
+        self.LineEditDataParamsDict['slit_pa'].setText(self.LineEditModelParamsDictForGeometry['pa'].text())
         #
         self.LineEditModelParamsDictForDarkMatterHalo['mvirial'].setText(str(np.round(self.LineEditModelParamsDictForBulgeDisk['total_mass'].keyvalue()+np.random.uniform(low=0.5, high=1.0, size=(1))[0], 3)))
         self.LineEditModelParamsDictForDarkMatterHalo['halo_conc'].setText(str(np.round(np.random.uniform(low=3.0, high=6.0, size=(1))[0], 3)))
@@ -2382,11 +2963,14 @@ class QDysmalPyGUI(QMainWindow):
         elif has_par:
             if np.any([t in self.DysmalPyParams for t in ['fdata', 'fdata_vel', 'fdata_cube']]):
                 has_data = True
-            if np.all([((t in self.DysmalPyParams) and (self.DysmalPyParams[t] is not None)) for t in [
-                        'total_mass', 'bt', 'r_eff_disk',
+            if np.all([((t in self.DysmalPyParams) and (self.DysmalPyParams[t] is not None)) 
+                       for t in [
+                        'total_mass', 'bt', 'r_eff_disk', 
                         'n_disk', 'r_eff_bulge', 'n_bulge', 'sigma0', 'sigmaz', 'inc', 'pa',
-                        'mvirial', 'halo_conc', 'fdm']]):
+                        'mvirial', 'halo_conc', 'fdm']
+                      ]):
                 has_validpar = True
+                #print('has_validpar', has_validpar) # 20250728 DZLIU DEBUG
             if self.DysmalPyFittingTower is not None:
                 if self.DysmalPyFittingTower.DysmalPyFitResultFile is not None:
                     if os.path.exists(self.DysmalPyFittingTower.DysmalPyFitResultFile):
@@ -2462,11 +3046,14 @@ class QDysmalPyGUI(QMainWindow):
     @pyqtSlot()
     def fitDataAsync(self, doFit=True, clearFitResults=True):
         self.logger.debug('fitDataAsync(doFit={},clearFitResults={})'.format(doFit, clearFitResults))
+        print('fitDataAsync(doFit={},clearFitResults={})'.format(doFit, clearFitResults))
         #
         if self.DysmalPyFittingTower.CurrentStarship is not None:
             if self.DysmalPyFittingTower.CurrentStarship.busy:
                 self.logMessage(self.tr('Current subprocess is still running.'))
                 return
+            if clearFitResults:
+                self.DysmalPyFittingTower.DysmalPyFitResults = None
         # 
         self.setButtonsEnabledDisabled(allDisabled=True)
         # pass data to DysmalPyFittingTower, which will be redirected to DysmalPyFittingStarship
@@ -2493,6 +3080,8 @@ class QDysmalPyGUI(QMainWindow):
             if self.DysmalPyFittingTower.CurrentStarship.busy:
                 self.logMessage(self.tr('Current subprocess is still running.'))
                 return
+            if clearFitResults:
+                self.DysmalPyFittingTower.DysmalPyFitResults = None
         #
         self.setButtonsEnabledDisabled(allDisabled=True)
         # pass data to DysmalPyFittingTower, which will be redirected to DysmalPyFittingStarship
@@ -2517,6 +3106,8 @@ class QDysmalPyGUI(QMainWindow):
             if self.DysmalPyFittingTower.CurrentStarship.busy:
                 self.logMessage(self.tr('Current subprocess is still running.'))
                 return
+            if clearFitResults:
+                self.DysmalPyFittingTower.DysmalPyFitResults = None
         #
         self.setButtonsEnabledDisabled(allDisabled=True)
         # pass data to DysmalPyFittingTower, which will be redirected to DysmalPyFittingStarship
@@ -2540,6 +3131,8 @@ class QDysmalPyGUI(QMainWindow):
             if self.DysmalPyFittingTower.CurrentStarship.busy:
                 self.logMessage(self.tr('Current subprocess is still running.'))
                 return
+            if clearFitResults:
+                self.DysmalPyFittingTower.DysmalPyFitResults = None
         #
         self.setButtonsEnabledDisabled(allDisabled=True)
         # pass data to DysmalPyFittingTower, which will be redirected to DysmalPyFittingStarship
@@ -2776,6 +3369,9 @@ class QDysmalPyFittingTower(QObject, Thread):
         self.data_flux_map = None
         self.data_vel_map = None
         self.data_disp_map = None
+        self.data_flux_err_map = None
+        self.data_vel_err_map = None
+        self.data_disp_err_map = None
         self.data_mask_map = None
         self.data_flux_curve = None
         self.data_vel_curve = None
@@ -3096,7 +3692,10 @@ class QDysmalPyFittingTower(QObject, Thread):
                                         self.logger.debug('queue signal ' + signal_name +
                                                           ' emitted as pyqtSignal')
                                         if len(signal_content) > 0:
-                                            this_signal.emit(*signal_content)
+                                            if isinstance(signal_content, str):
+                                                this_signal.emit(signal_content)
+                                            else:
+                                                this_signal.emit(*signal_content)
                                         else:
                                             this_signal.emit()
                             else:
@@ -3209,6 +3808,9 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         self.data_flux_map = None
         self.data_vel_map = None
         self.data_disp_map = None
+        self.data_flux_err_map = None
+        self.data_vel_err_map = None
+        self.data_disp_err_map = None
         self.data_mask_map = None
         self.data_flux_curve = None
         self.data_vel_curve = None
@@ -3476,16 +4078,16 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             self.queue_out.put( ('signal', 'finished') )
         self.busy = False
     
-    def emit_finished_with_error(self):
+    def emit_finished_with_error(self, err_msg):
         if self.queue_out is not None:
             self.logger.debug('queue_out.put signal finishedWithError')
-            self.queue_out.put( ('signal', 'finishedWithError') )
+            self.queue_out.put( ('signal', 'finishedWithError', err_msg) )
         self.busy = False
     
-    def emit_finished_with_warning(self):
+    def emit_finished_with_warning(self, err_msg):
         if self.queue_out is not None:
             self.logger.debug('queue_out.put signal finishedWithWarning')
-            self.queue_out.put( ('signal', 'finishedWithWarning') )
+            self.queue_out.put( ('signal', 'finishedWithWarning', err_msg) )
         self.busy = False
     
     def send_data_to_queue(self, list_of_data_name, list_of_data_content = None):
@@ -3566,36 +4168,75 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             self.emit_started()
         self.log_message('Getting dysmalpy galaxy object and fit dict from params.')
         if params is None:
-            self.log_message('Error! dysmalpy params is invalid!')
+            err_msg = 'Error! dysmalpy params is invalid!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
+        # 
+        if 'nObs' not in params:
+            params['nObs'] = 1
+        if 'obs_1_name' not in params:
+            params['obs_1_name'] = 'obs'
+        if 'obs_1_tracer' not in params:
+            params['obs_1_tracer'] = 'gas'
         #
         gal = None
-        fit_dict = None
-        if 'fdata' in params.keys():
-            ndim_fit = 1
-            gal, fit_dict = setup_single_object_1D(params=params, data=None)
-        elif 'fdata_vel' in params.keys():
-            ndim_fit = 2
-            gal, fit_dict = setup_single_object_2D(params=params, data=None)
-        elif 'fdata_cube' in params.keys():
-            ndim_fit = 3
-            gal, fit_dict = setup_single_object_3D(params=params, data=None)
+        fit_dict = None # 20250827 new dysmalpy uses output_options instead
+        output_options = None # 20250827 new dysmalpy uses output_options instead
+        #if 'fdata' in params.keys():
+        #    ndim_fit = 1
+        #    gal, fit_dict = setup_single_galaxy(params=params, data=None)
+        #    gal.instrument = gal.observations[list(gal.observations.keys())[0]].instrument
+        #elif 'fdata_vel' in params.keys():
+        #    ndim_fit = 2
+        #    gal, fit_dict = setup_single_galaxy(params=params, data=None)
+        #    gal.instrument = gal.observations[list(gal.observations.keys())[0]].instrument
+        #elif 'fdata_cube' in params.keys():
+        #    ndim_fit = 3
+        #    gal, fit_dict = setup_single_galaxy(params=params, data=None)
+        #    gal.instrument = gal.observations[list(gal.observations.keys())[0]].instrument
+        # 20240830
+        if 'fdata' in params.keys() or 'fdata_vel' in params.keys() or 'fdata_cube' in params.keys(): # 20240906
+            # 20250827
+            #gal, fit_dict_options = setup_single_galaxy(params=params)
+            #fit_dict = fit_dict_options.as_dict()
+            #print('fit_dict', fit_dict) #<DZLIU><20240906># how to get fit_dict now?
+            gal, output_options = setup_single_galaxy(params=params)
+            fit_dict = output_options.as_dict()
+            obs = gal.observations[list(gal.observations.keys())[0]]
+            gal.instrument = obs.instrument
+            gal.data = obs.data
+            #print('gal.model.mass_components', gal.model.mass_components)
         else:
             self.log_message('Warning! No data defined in DysmalPyParams. '+
                              'Please check the \'fdata\', \'fdata_vel\' or \'fdata_cube\' keys.')
             self.log_message('Setting up galaxy model base...')
-            if params['psf_fwhm'] is None or params['psf_fwhm'] == '' or params['psf_fwhm'] == 'None':
+            has_psf = False
+            if 'psf_fwhm' in params:
+                if params['psf_fwhm'] not in [None, '', 'None']:
+                    has_psf = True
+            if 'psf_fwhm_major' in params:
+                if params['psf_fwhm_major'] not in [None, '', 'None']:
+                    has_psf = True
+            if not has_psf:
                 # allow user to set psf_fwhm to None, and here we do some tricks to skip the convolution with a psf
                 copy_psf_fwhm = params['psf_fwhm']
                 params['psf_fwhm'] = 0.1
                 gal = setup_gal_model_base(params=params)
+                # 20240830
+                obs = make_empty_observation(0, ndim=2, params=params)
+                gal.observations[params['obs_1_name']] = obs
+                gal.instrument = obs.instrument
                 gal.instrument.beam = None
                 gal.instrument._beam_kernel = None
                 params['psf_fwhm'] = copy_psf_fwhm
             else:
                 gal = setup_gal_model_base(params=params)
+                # 20240830
+                obs = make_empty_observation(0, ndim=2, params=params)
+                gal.observations[params['obs_1_name']] = obs
+                gal.instrument = obs.instrument
             #gal.data = data_io.load_single_object_1D_data(fdata=params['fdata'], fdata_mask=fdata_mask, params=params, datadir=datadir)
             #gal.data = data_classes.Data1D(...)
             #gal.data.filename_velocity = datadir+params['fdata']
@@ -3604,7 +4245,12 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             #gal.data.profile1d_type = params['profile1d_type']
             #fit_dict = setup_fit_dict(params=params, ndim_data=1)
         #
-        return gal, fit_dict
+        #20230912
+        #print('DEBUGGING: get_dysmalpy_gal() gal.instrument.beam: {} {} {}'.format(
+        #    gal.instrument.beam._major, gal.instrument.beam._minor, gal.instrument.beam._pa))
+        # 
+        #return gal, fit_dict # 20250827 new dysmalpy uses output_options instead
+        return gal, fit_dict, output_options # 20250827 new dysmalpy uses output_options instead
     
     def fit_data(self, params, do_fit = True, overwrite = False, param_filename = None, block_signal = False):
         #
@@ -3616,17 +4262,20 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         else:
             self.log_message('Preparing to load fitting result...')
         if params is None:
-            self.log_message('Error! dysmalpy params is invalid! Could not proceed to fit the data!')
+            err_msg = 'Error! dysmalpy params is invalid! Could not proceed to fit the data!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
-        gal, fit_dict = self.get_dysmalpy_gal(params)
+        #gal, fit_dict = self.get_dysmalpy_gal(params) # 20250827 new dysmalpy uses output_options instead
+        gal, fit_dict, output_options = self.get_dysmalpy_gal(params) # 20250827 new dysmalpy uses output_options instead
         #
         if gal is None or fit_dict is None:
-            self.log_message('Error! Could not get DysmalPyGal and DysmalPyFitDict from DysmalPyParams?!')
+            err_msg = 'Error! Could not get DysmalPyGal and DysmalPyFitDict from DysmalPyParams?!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
         check_fixed_pars = []
@@ -3658,22 +4307,35 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                 check_str += '\n'
         self.logger.debug('gal.model pars: \n' + check_str)
         # 
-        if fit_dict['fit_method'] == 'mcmc':
+        # 20250827
+        fitter = utils_io.setup_fitter(params=params)
+        output_options.set_output_options(gal, fitter)
+        output_options.overwrite = True
+        # 
+        # 20250827
+        #fit_method = fit_dict['fit_method']
+        #do_plotting = fit_dict['do_plotting']
+        fit_method = fitter.fit_method.lower()
+        do_plotting = output_options.do_plotting
+        # 
+        if fit_method == 'mcmc':
             output_pickle_file = os.path.join(params['outdir'], params['galID']+'_mcmc_results.pickle')
-        elif fit_dict['fit_method'] == 'mpfit':
+        elif fit_method == 'mpfit':
             output_pickle_file = os.path.join(params['outdir'], params['galID']+'_mpfit_results.pickle')
         else:
-            self.log_message('Error! fit_method must be \'mcmc\' or \'mpfit\'! Could not do the fitting!')
+            err_msg = 'Error! fit_method must be \'mcmc\' or \'mpfit\'! Could not do the fitting!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
-        self.log_message('Setting fit_method to '+fit_dict['fit_method']+'.')
+        self.log_message('Setting fit_method to '+fit_method+'.')
         #
-        config_c_m_data = config.Config_create_model_data(**fit_dict)
-        config_sim_cube = config.Config_simulate_cube(**fit_dict)
-        kwargs_galmodel = {**config_c_m_data.dict, **config_sim_cube.dict}
-        kwargs_galmodel['lensing_transformer'] = self.lensing_transformer
-        kwargs_all = {**kwargs_galmodel, **fit_dict}
+        # 20250827
+        #config_c_m_data = config.Config_create_model_data(**fit_dict)
+        #config_sim_cube = config.Config_simulate_cube(**fit_dict)
+        #kwargs_galmodel = {**config_c_m_data.dict, **config_sim_cube.dict}
+        #kwargs_galmodel['lensing_transformer'] = self.lensing_transformer
+        #kwargs_all = {**kwargs_galmodel, **fit_dict}
         #
         fit_results = None
         #
@@ -3681,44 +4343,56 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             # check DysmalPy param limits
             #self.checkDysmalPyParams()
             # log message
-            self.log_message('Fitting with fit_method ' + fit_dict['fit_method'] + '...')
+            self.log_message('Fitting with fit_method ' + fit_method + '...')
             # run the DysmalPy fitting
-            if fit_dict['fit_method'] == 'mcmc':
-                fit_results = fitting.fit_mcmc(gal, **kwargs_all)
+            if fit_method == 'mcmc':
+                #fit_results = fitting.fit_mcmc(gal, **kwargs_all) # 20250827 new dysmalpy
+                fit_results = fitter.fit(gal, output_options)
                 self.log_message('fit_mcmc done')
-            elif fit_dict['fit_method'] == 'mpfit':
-                fit_results = fitting.fit_mpfit(gal, **kwargs_all)
+            elif fit_method == 'mpfit':
+                #fit_results = fitting.fit_mpfit(gal, **kwargs_all) # 20250827 new dysmalpy
+                fit_results = fitter.fit(gal, output_options)
                 self.log_message('fit_mpfit done')
             else:
-                self.log_message('Error! fit_method must be \'mcmc\' or \'mpfit\'! Could not do the fitting!')
+                err_msg = 'Error! fit_method must be \'mcmc\' or \'mpfit\'! Could not do the fitting!'
+                self.log_message(err_msg)
                 if not block_signal:
-                    self.emit_finished_with_error()
+                    self.emit_finished_with_error(err_msg)
                 return
             # check output file
             if not os.path.isfile(output_pickle_file):
-                self.log_message('Error! Output file not produced?! ')+str(output_pickle_file)
+                err_msg = 'Error! Output file not produced?! '+str(output_pickle_file)
+                self.log_message(err_msg)
                 if not block_signal:
-                    self.emit_finished_with_error()
+                    self.emit_finished_with_error(err_msg)
                 return
             else:
                 self.log_message('Output to '+str(output_pickle_file)+'.')
             # 
             # Save text results
             # see dysmalpy_fit_single.py
-            utils_io.save_results_ascii_files(
-                fit_results=fit_results, 
-                gal=gal, 
-                params=params,
-                overwrite=overwrite)
+            # 20250827 new dysmalpy has no save_results_ascii_files
+            #utils_io.save_results_ascii_files(
+            #    fit_results=fit_results, 
+            #    gal=gal, 
+            #    params=params,
+            #    overwrite=overwrite)
             # 
             # Save more results
             # see XXX.py
+            # 20250827 new dysmalpy has no save_results_ascii_files
+            #fit_results.results_report(
+            #    gal=gal,
+            #    params=params,
+            #    overwrite=overwrite,
+            #    filename=os.path.join(params['outdir'], 
+            #        str(params['galID'])+'_'+str(params['fit_method'])+'_fit_report.txt'), 
+            #    )
             fit_results.results_report(
                 gal=gal,
-                params=params,
-                overwrite=overwrite,
                 filename=os.path.join(params['outdir'], 
                     str(params['galID'])+'_'+str(params['fit_method'])+'_fit_report.txt'), 
+                output_options=output_options,
                 )
             # 
             # Save more results
@@ -3732,38 +4406,47 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                     'delta_cont_v_minor': 10.,
                     'max_residual': 100.,
                     }
+                # 20250827
+                kwargs_contour_data = {}
+                # 
                 plotting.plot_data_model_comparison(
                     gal=gal,
                     show_contours=True, 
-                    fitflux=False, #<TODO>#
+                    #fitflux=False, #<TODO>#
                     fileout=os.path.join(params['outdir'], 
                         str(params['galID'])+'_'+str(params['fit_method'])+'_fit_datmod_comp.pdf'),
-                    **kwargs_contour_data)
+                    **kwargs_contour_data
+                )
             # 
             # Save params file
             # see dysmalpy_fit_single.py
             # param_filename = os.path.join(params['outdir'], 'fit.params') #<TODO># always save as this file name
             if param_filename is not None:
-                data_io.ensure_dir(params['outdir'])
+                #data_io.ensure_dir(params['outdir']) # 20250827?
+                #fitting.ensure_dir(params['outdir'])
+                if params['outdir'] is not None and params['outdir'] != '' and not os.path.exists(params['outdir']):
+                    os.makedirs(params['outdir'])
                 utils_io.preserve_param_file(param_filename, params=params, 
                                              datadir=params['datadir'], 
                                              outdir=params['outdir'])
                 # 
                 # Make component plot
                 # see dysmalpy_fit_single.py
-                if fit_dict['do_plotting']:
+                if do_plotting:
                     ndim = gal.data.ndim
-                    if ndim == 1:
-                        plot_bundle_1D(
-                            params=params, fit_dict=fit_dict, param_filename=param_filename,
-                            plot_type='pdf', overwrite=overwrite,
-                            **kwargs_galmodel)
-                    elif ndim == 2:
-                        plot_bundle_2D(
-                            params=params, param_filename=param_filename, 
-                            plot_type='pdf', overwrite=overwrite)
-                    elif ndim == 3:
-                        pass
+                    # 20250827
+                    # if ndim == 1:
+                    #     plot_bundle_1D(
+                    #         params=params, fit_dict=fit_dict, param_filename=param_filename,
+                    #         plot_type='pdf', overwrite=overwrite,
+                    #         **kwargs_galmodel)
+                    # elif ndim == 2:
+                    #     plot_bundle_2D(
+                    #         params=params, param_filename=param_filename, 
+                    #         plot_type='pdf', overwrite=overwrite)
+                    # elif ndim == 3:
+                    #     pass
+                    plot_1D_rotcurve_components(gal, output_options) # 20250827 new dysmalpy
                     # 
                     self.log_message('Successfully fitted the data and plotted the results.')
             else:
@@ -3776,20 +4459,24 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             gal, fit_results = fitting.reload_all_fitting(\
                                         filename_galmodel=fit_dict['f_model'],
                                         filename_results=fit_dict['f_results'],
-                                        fit_method=params['fit_method'])
+                                        fit_method=fit_method)
             self.log_message('Successfully loaded previous fitting.')
         else:
-            self.log_message('Warning! Previous fitting result not found. Please click the "Fit Data" button to run a fit.')
+            err_msg = 'Warning! Previous fitting result not found. Please click the "Fit Data" button to run a fit.'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_warning()
+                self.emit_finished_with_warning(err_msg)
             return
+        # 
+        gal.data = gal.observations['OBS'].data # 20250827 fix for compatible issue
+        gal.model_cube = gal.observations['OBS'].model_cube # 20250827 fix for compatible issue
         # 
         self.data_cube = None
         if hasattr(gal, 'data'):
             if hasattr(gal.data, 'data'):
                 if gal.data.ndim == 3:
                     self.data_cube = copy.copy(gal.data.data)
-        self.model_cube = copy.copy(gal.model_cube.data)
+        self.model_cube = gal.model_cube.data # 20250827 new dysmalpy
         self.model_cube_data_array = self.model_cube._data
         self.model_cube_header_info = self.model_cube._header
         # self.params = params
@@ -3806,15 +4493,16 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         # 
         self.send_lensing_data_to_queue()
         #
+        print('generate_moment_maps', 'L4491')
         self.generate_moment_maps(params, gal, block_signal = True)
         if self.last_log_message.startswith('Error!'):
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(self.last_log_message)
         #
         self.generate_rotation_curves(params, gal, block_signal = True)
         if self.last_log_message.startswith('Error!'):
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(self.last_log_message)
         #
         if do_fit:
             self.log_message('Successfully generated the model cube, moment maps and rotation curves.')
@@ -3823,30 +4511,42 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             self.emit_finished()
     
     def generate_model_cube(self, params, block_signal = False):
+        print('generate_model_cube')
         #
         if not block_signal:
             self.emit_started()
         #
         self.log_message('Generating model cube...')
         if params is None:
-            self.log_message('Error! DysmalPyParams is invalid!' +
-                             'Could not proceed to generate the model cube.')
+            err_msg = 'Error! DysmalPyParams is invalid!' + \
+                      'Could not proceed to generate the model cube.'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
-        gal, fit_dict = self.get_dysmalpy_gal(params)
+        try:
+            # 20250827
+            #gal, fit_dict = self.get_dysmalpy_gal(params)
+            gal, fit_dict, output_options = self.get_dysmalpy_gal(params)
+        except Exception as err:
+            #traceback.print_tb(err.__traceback__)
+            traceback.print_exc()
+            self.logger.exception(err)
+            gal = None
         #
         if gal is None:
-            self.log_message('Error! Could not set DysmalPyGal from DysmalPyParams?!')
+            err_msg = 'Error! Could not set DysmalPyGal from DysmalPyParams?!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         if gal.instrument is None:
-            self.log_message('Error! DysmalPyGal.instrument is invalid! ' +
-                             'Could not proceed to generate the model cube.')
+            err_msg = 'Error! DysmalPyGal.instrument is invalid! ' + \
+                      'Could not proceed to generate the model cube.'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
         # create model cube from_instrument:
@@ -3864,7 +4564,13 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         else:
             aperture_radius = 0.1
         oversample = params['oversample']
+        if oversample is None or str(oversample) == 'None':
+            oversample = 1
+            params['oversample'] = 1
         oversize = params['oversize']
+        if oversize is None or str(oversize) == 'None':
+            oversize = 1
+            params['oversize'] = 1
         pixscale = params['pixscale']
         fov_npix = params['fov_npix']
         xcenter = params['xcenter']
@@ -3882,34 +4588,69 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         kwargs_galmodel = setup_lensing_dict(params)
         kwargs_galmodel['lensing_transformer'] = self.lensing_transformer
         #kwargs_galmodel['gauss_extract_with_c'] = params['gauss_extract_with_c'] #20211111
-        for key in ['moment_calc', 'gauss_extract_with_c']:
+        for key in ['moment_calc', 'gauss_extract_with_c', 'zcalc_truncate', 'zcalc_with_c']:
             if key in params:
                 kwargs_galmodel[key] = params[key] #20211111
-                print(f'kwargs_galmodel[{key!r}] = params[{key!r}]') #20211111 DEBUG
+                # print(f'kwargs_galmodel[{key!r}] = params[{key!r}] = {params[key]!r}') #20211111 DEBUG
         from_data = False # must set from_data = False to let the input ndim_final = 3 in effect
-        self.logger.debug("self.lensing_transformer " + str(self.lensing_transformer))
-        self.logger.debug("kwargs_galmodel['lensing_transformer'] " + str(kwargs_galmodel['lensing_transformer']))
-        self.logger.debug("hasattr(gal, 'instrument') " + str(hasattr(gal, 'instrument')))
-        self.logger.debug("hasattr(gal, 'model') " + str(hasattr(gal, 'model')))
+        # self.logger.debug("self.lensing_transformer " + str(self.lensing_transformer))
+        # self.logger.debug("kwargs_galmodel['lensing_transformer'] " + str(kwargs_galmodel['lensing_transformer']))
+        # self.logger.debug("hasattr(gal, 'instrument') " + str(hasattr(gal, 'instrument')))
+        # self.logger.debug("hasattr(gal, 'model') " + str(hasattr(gal, 'model')))
         gal.model._update_tied_parameters()
-        gal.create_model_data(\
-                            ndim_final = ndim_final,
-                            profile1d_type = profile1d_type,
-                            aperture_radius = aperture_radius,
-                            aper_centers = aper_centers,
-                            from_instrument = True,
-                            from_data = from_data,
-                            oversample = oversample,
-                            oversize = oversize,
-                            xcenter = xcenter,
-                            ycenter = ycenter,
-                            **kwargs_galmodel,
-                            )
-        self.logger.debug("self.lensing_transformer " + str(self.lensing_transformer))
-        self.logger.debug("kwargs_galmodel['lensing_transformer'] " + str(kwargs_galmodel['lensing_transformer']))
+        # 20240830
+        #obs = gal.observations[list(gal.observations.keys())[0]]
+        # print('gal.create_model_data')
+        # print('gal.dscale', gal.dscale)
+        # print('obs.instrument.moment', obs.instrument.moment, "kwargs_galmodel['moment_calc']", kwargs_galmodel['moment_calc'])
+        # print('obs.mod_options.gauss_extract_with_c', obs.mod_options.gauss_extract_with_c, "kwargs_galmodel['gauss_extract_with_c']", kwargs_galmodel['gauss_extract_with_c'])
+        # print('obs.instrument.ndim', obs.instrument.ndim)
+        # print('obs.instrument.fov[0]', obs.instrument.fov[0])
+        # print('obs.instrument.fov[1]', obs.instrument.fov[1])
+        # print('obs.instrument.spec_type', obs.instrument.spec_type)
+        # print('obs.instrument.spec_step.unit', obs.instrument.spec_step.unit)
+        # print('obs.instrument.nspec', obs.instrument.nspec)
+        # print('obs.instrument.pixscale.value', obs.instrument.pixscale.value)
+        # print('obs.mod_options.oversample', obs.mod_options.oversample)
+        # print('obs.mod_options.oversize', obs.mod_options.oversize)
+        # print('obs.lensing_options', obs.lensing_options)
+        # print('kwargs_galmodel', kwargs_galmodel)
+        if 'lensing_mesh' in params:
+            obs.lensing_options.load(**kwargs_galmodel)
+            print('obs.lensing_options.get_lensing_kwargs()', obs.lensing_options.get_lensing_kwargs(oversample=obs.mod_options.oversample, oversize=obs.mod_options.oversize))
+        #print('obs.instrument.smoothing_type', obs.instrument.smoothing_type)
+        #obs.create_single_obs_model_data(gal.model, gal.dscale)
+        gal.create_model_data()
+        obs = gal.observations[list(gal.observations.keys())[0]]
+        #gal.create_model_data(\
+        #                    ndim_final = ndim_final,
+        #                    profile1d_type = profile1d_type,
+        #                    aperture_radius = aperture_radius,
+        #                    aper_centers = aper_centers,
+        #                    from_instrument = True,
+        #                    from_data = from_data,
+        #                    oversample = oversample,
+        #                    oversize = oversize,
+        #                    xcenter = xcenter,
+        #                    ycenter = ycenter,
+        #                    **kwargs_galmodel,
+        #                    )
+        #print('obs.model_cube.data', obs.model_cube.data)
+        #fits.PrimaryHDU(data=obs.model_cube.data).writeto('tmp.obs.model_cube.fits', overwrite=True)
+        gal.model_cube = obs.model_cube
+        gal.model_data = obs.model_data
+        gal.data = obs.data
+        #self.logger.debug("self.lensing_transformer " + str(self.lensing_transformer))
+        #self.logger.debug("kwargs_galmodel['lensing_transformer'] " + str(kwargs_galmodel['lensing_transformer']))
         #
+        # 20240830 new dysmalpy
         self.model_cube = copy.copy(gal.model_cube.data)
-        self.model_cube_data_array = self.model_cube._data
+        #self.model_cube_data_array = self.model_cube._data
+        #self.model_cube_header_info = self.model_cube._header
+        if gal.data.mask is not None: #20251008
+            self.model_cube = self.model_cube.with_mask(gal.data.mask) #20251008
+            #print('self.model_cube = self.model_cube.with_mask(gal.data.mask) #20251008')
+        self.model_cube_data_array = self.model_cube.filled(np.nan).value
         self.model_cube_header_info = self.model_cube._header
         # self.params = params
         self.gal = gal
@@ -3924,13 +4665,13 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         self.generate_moment_maps(params, gal, block_signal = True)
         if self.last_log_message.startswith('Error!'):
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(self.last_log_message)
             return
         #
         self.generate_rotation_curves(params, gal, block_signal = True)
         if self.last_log_message.startswith('Error!'):
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(self.last_log_message)
             return
         #
         self.logger.debug('generateModelCube: done')
@@ -3943,12 +4684,26 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         if not isinstance(data_cube, SpectralCube):
             self.log_message('Error! The input data cube to compute_moment_maps_from_cube is not a SpectralCube!')
             return None, None, None
+
+        if data_mask is not None:
+            data_cube = data_cube.with_mask(data_mask)
+            #print('data_cube = data_cube.with_mask(data_mask) *** DEBUG ***')
+        
         mom0 = data_cube.moment0().to(u.km/u.s).value
         mom1 = data_cube.moment1().to(u.km/u.s).value
-        mom2 = data_cube.linewidth_sigma().to(u.km/u.s).value
+        #mom2 = data_cube.linewidth_sigma().to(u.km/u.s).value # this will contain nan if mom2 has negative values
+        mom2 = np.sqrt(np.abs(data_cube.moment2().to((u.km/u.s)**2).value))
         flux = np.zeros(mom0.shape)
         vel = np.zeros(mom0.shape)
         disp = np.zeros(mom0.shape)
+
+        #dataarr = data_cube.unmasked_data[:,:,:].value
+        dataarr = data_cube.filled(np.nan).value
+        specarr = data_cube.spectral_axis.to(u.km/u.s).value
+        specarrmin = specarr.min()
+        specarrmax = specarr.max()
+        mom1[mom1<specarrmin] = specarrmin+0.01*(specarrmax-specarrmin)
+        mom1[mom1>specarrmax] = specarrmax-0.01*(specarrmax-specarrmin)
         
         # <DZLIU><20210805> ++++++++++
         #logger.debug('data_cube.spectral_axis.to(u.km/u.s).value: '+str(data_cube.spectral_axis.to(u.km/u.s).value))
@@ -3960,29 +4715,62 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                 this_fitting_mask = 'auto'
                 if data_mask is not None:
                     if hasattr(data_mask, 'shape'):
-                        if len(data_mask.shape) in [2, 3]:
+                        if len(data_mask.shape) == 2:
+                            this_fitting_mask = copy.copy(data_mask)
+                        elif len(data_mask.shape) == 3:
+                            # the C++ code has a problem that it skips a pixel if any channel is masked out, so we only input a 2D mask
+                            #this_fitting_mask = (np.sum(data_mask.astype(int), axis=0)>0)
                             this_fitting_mask = copy.copy(data_mask)
                 if logger.level > logging.DEBUG:
                     this_fitting_verbose = True
                 else:
                     this_fitting_verbose = False
+                init_amp = np.abs(mom0/np.sqrt(2*np.pi)/np.abs(mom2))
+                init_mean = mom1
+                init_sigma = np.abs(mom2)
+                # print('***DEBUG*** np.count_nonzero(np.isnan(init_amp))', np.count_nonzero(np.isnan(init_amp)))
+                # print('***DEBUG*** np.count_nonzero(np.isnan(init_mean))', np.count_nonzero(np.isnan(init_mean)))
+                # print('***DEBUG*** np.count_nonzero(np.isnan(init_sigma))', np.count_nonzero(np.isnan(init_sigma)))
+                # print('***DEBUG*** np.count_nonzero(np.invert(this_fitting_mask))', np.count_nonzero(np.invert(this_fitting_mask)))
+                nanmax = np.nanmax(data_cube.unmasked_data[:,:,:].value)
+                init_amp[np.isnan(init_amp)] = 1.0
+                init_amp[init_amp > nanmax] = nanmax
+                init_amp[init_amp < 0.0] = nanmax * 0.001
+                init_mean[np.isnan(init_mean)] = 0.0
+                init_sigma[np.isnan(init_sigma)] = 1.0
+                init_sigma[init_sigma <= 1.0] = 1.0
+                # 20250827 debugging
+                #fits.PrimaryHDU(dataarr).writeto('tmp.dataarr.fits', overwrite=True)
+                #fits.PrimaryHDU(init_amp).writeto('tmp.init_amp.fits', overwrite=True)
+                #fits.PrimaryHDU(init_mean).writeto('tmp.init_mean.fits', overwrite=True)
+                #fits.PrimaryHDU(init_sigma).writeto('tmp.init_sigma.fits', overwrite=True)
                 my_least_chi_squares_1d_fitter = LeastChiSquares1D(\
-                        x = data_cube.spectral_axis.to(u.km/u.s).value,
+                        x = specarr,
                         data = data_cube.unmasked_data[:,:,:].value,
                         dataerr = None,
                         datamask = this_fitting_mask,
-                        initparams = np.array([mom0 / np.sqrt(2 * np.pi) / np.abs(mom2), mom1, mom2]),
+                        initparams = np.array([init_amp, init_mean, init_sigma]),
                         nthread = 4,
-                        verbose = this_fitting_verbose)
+                        verbose = this_fitting_verbose,
+                        #nthread = 1,
+                        #verbose = True,
+                        #c_verbose = 3,
+                    )
         if my_least_chi_squares_1d_fitter is not None:
             self.logger.debug('my_least_chi_squares_1d_fitter '+str(datetime.datetime.now())) #<DZLIU><DEBUG>#
-            my_least_chi_squares_1d_fitter.runFitting()
-            flux = my_least_chi_squares_1d_fitter.outparams[0,:,:] * np.sqrt(2 * np.pi) * my_least_chi_squares_1d_fitter.outparams[2,:,:]
-            vel = my_least_chi_squares_1d_fitter.outparams[1,:,:]
-            disp = my_least_chi_squares_1d_fitter.outparams[2,:,:]
-            flux[np.isnan(flux)] = 0.0 #<DZLIU><DEBUG># 20210809 fixing this bug
-            self.logger.debug('my_least_chi_squares_1d_fitter '+str(datetime.datetime.now())) #<DZLIU><DEBUG>#
-        else:
+            try:
+                my_least_chi_squares_1d_fitter.runFitting()
+                flux = my_least_chi_squares_1d_fitter.outparams[0,:,:] * np.sqrt(2 * np.pi) * my_least_chi_squares_1d_fitter.outparams[2,:,:]
+                vel = my_least_chi_squares_1d_fitter.outparams[1,:,:]
+                disp = my_least_chi_squares_1d_fitter.outparams[2,:,:]
+                badmask = np.logical_or.reduce((np.isnan(flux), flux<-1e10, flux>1e10, vel<specarrmin, vel>specarrmax))
+                flux[badmask] = np.nan #<DZLIU><DEBUG># 20210809 fixing this bug
+                vel[badmask] = np.nan
+                disp[badmask] = np.nan
+                self.logger.debug('my_least_chi_squares_1d_fitter '+str(datetime.datetime.now())) #<DZLIU><DEBUG>#
+            except:
+                my_least_chi_squares_1d_fitter = None
+        if my_least_chi_squares_1d_fitter is None:
             for i in range(mom0.shape[0]):
                 for j in range(mom0.shape[1]):
                     if i==0 and j==0:
@@ -3996,6 +4784,14 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                     if i==mom0.shape[0]-1 and j==mom0.shape[1]-1:
                         self.logger.debug('gaus_fit_sp_opt_leastsq '+str(mom0.shape[0])+'x'+str(mom0.shape[1])+' '+str(datetime.datetime.now())) #<DZLIU><DEBUG>#
         # <DZLIU><20210805> ----------
+
+        if data_mask is not None:
+            if len(data_mask.shape) == 3:
+                data_mask_2D = (np.sum(data_mask.astype(int), axis=0) > 0)
+                flux[~data_mask_2D] = np.nan
+                vel[~data_mask_2D] = np.nan
+                disp[~data_mask_2D] = np.nan
+
         return flux, vel, disp
     
     def generate_moment_maps(self, params, gal = None, block_signal = False):
@@ -4005,38 +4801,51 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         self.log_message('Generating moment maps...')
         #
         if params is None:
-            self.log_message('Error! DysmalPyParams is invalid! ' +
-                             'Could not proceed to generate the moment maps. ' +
-                             'Please set dysmalpy params first!')
+            err_msg = 'Error! DysmalPyParams is invalid! ' + \
+                      'Could not proceed to generate the moment maps. ' + \
+                      'Please set dysmalpy params first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         if gal is None:
             gal = self.gal
         if gal is None:
-            self.log_message('Error! DysmalPyGal is invalid! ' +
-                             'Could not proceed to generate the moment maps. ' +
-                             'Please run generate_model_cube first!')
+            err_msg = 'Error! DysmalPyGal is invalid! ' + \
+                      'Could not proceed to generate the moment maps. ' + \
+                      'Please run generate_model_cube first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         if gal.model_cube is None:
-            self.log_message('Error! DysmalPyGal.model_cube is invalid! ' +
-                             'Could not proceed to generate the moment maps. ' +
-                             'Please run generate_model_cube first!')
+            err_msg = 'Error! DysmalPyGal.model_cube is invalid! ' + \
+                      'Could not proceed to generate the moment maps. ' + \
+                      'Please run generate_model_cube first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
         model_flux_map = None
         model_vel_map = None
         model_disp_map = None
         #
+        # 20250827 new dysmalpy: gal.data becomes gal.observations['OBS'].data, and gal.instrument becomes gal.observations['OBS'].instrument
+        if not hasattr(gal, 'data'): 
+            if hasattr(gal, 'observations'):
+                gal.data = gal.observations['OBS'].data
+        if not hasattr(gal, 'instrument'): 
+            if hasattr(gal, 'observations'):
+                gal.instrument = gal.observations['OBS'].instrument
+        # 
         data_mask = None
         if hasattr(gal, 'data'):
             if hasattr(gal.data, 'ndim'):
                 if gal.data.ndim in [2, 3]:
                     data_mask = gal.data.mask
+        if data_mask is not None:
+            print('***DEBUG*** np.count_nonzero(data_mask)', np.count_nonzero(data_mask), 'data_mask.shape', data_mask.shape)
         #
         model_flux_map, model_vel_map, model_disp_map = \
             self.compute_moment_maps_from_cube(params, gal.model_cube.data, data_mask)
@@ -4044,24 +4853,50 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         self.model_flux_map = model_flux_map
         self.model_vel_map = model_vel_map
         self.model_disp_map = model_disp_map
+        #fits.PrimaryHDU(model_flux_map).writeto('tmp.model_flux_map.fits', overwrite=True)
+        # 
+        #if 'vel_shift' in params: # 20230913
+        #    self.model_vel_map -= params['vel_shift']
         # 
         self.send_data_to_queue(['model_flux_map', 'model_vel_map', 'model_disp_map'])
+        # 
+        # print('generate_moment_maps', "hasattr(gal, 'data')", hasattr(gal, 'data')) # 20250827
+        # print('generate_moment_maps', "hasattr(gal, 'instrument')", hasattr(gal, 'instrument')) # 20250827
+        # print('gal.data.ndim', gal.data.ndim)
         # 
         if hasattr(gal, 'data'):
             if gal.data is not None:
                 self.data_flux_map = None
                 self.data_vel_map = None
                 self.data_disp_map = None
+                self.data_flux_err_map = None
+                self.data_vel_err_map = None
+                self.data_disp_err_map = None
                 self.data_mask_map = None
                 self.residual_flux_map = None
                 self.residual_vel_map = None
                 self.residual_disp_map = None
                 if gal.data.ndim == 3:
                     if hasattr(gal, 'data2d') and gal.data2d is not None:
+                        #print('using gal.data2d')
                         self.data_flux_map = gal.data2d.data['flux']
                         self.data_vel_map = gal.data2d.data['velocity']
                         self.data_disp_map = gal.data2d.data['dispersion']
+                        if hasattr(gal.data2d, 'error'):
+                            self.data_flux_err_map = gal.data2d.error['flux']
+                            self.data_vel_err_map = gal.data2d.error['velocity']
+                            self.data_disp_err_map = gal.data2d.error['dispersion']
                     else:
+                        # Get a mask2d first
+                        data_mask2d = None
+                        if gal.data.mask is not None:
+                            if len(gal.data.mask.shape) == 3:
+                                data_mask2d = np.any(gal.data.mask>0, axis=0).astype(int)
+                                self.data_mask_map = data_mask2d.astype(bool)
+                            elif len(gal.data.mask.shape) == 2:
+                                data_mask2d = gal.data.mask
+                                self.data_mask_map = data_mask2d.astype(bool)
+                        # 
                         # The input data is 3d, we need to extract 2d data.
                         # We can use the
                         # `dysmalpy.plotting.extract_1D_2D_data_gausfit_from_cube`
@@ -4079,16 +4914,19 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                         #
                         # however, the above method can be time consuming.
                         # Here we use our own method.
+                        #scube = copy.copy(gal.data.data)
+                        #scube._data[scube._data==-99] = np.nan
                         flux, vel, disp = self.compute_moment_maps_from_cube(
                             params,
-                            gal.data.data,
-                            data_mask = gal.data.mask,
+                            gal.data.data, 
+                            gal.data.mask, # same as data_mask
                         )
                         if flux is None or vel is None or disp is None:
-                            self.log_message('Error! Could not run compute_moment_maps_from_cube ' +
-                                             'to generate the moment maps for the data cube in 3D.')
+                            err_msg = 'Error! Could not run compute_moment_maps_from_cube ' + \
+                                      'to generate the moment maps for the data cube in 3D.'
+                            self.log_message(err_msg)
                             if not block_signal:
-                                self.emit_finished_with_error()
+                                self.emit_finished_with_error(err_msg)
                         # print('QDysmalPyFittingStarship generate_moment_maps '+
                         #       'flux.shape '+str(flux.shape)+
                         #       'vel.shape '+str(vel.shape)+
@@ -4097,42 +4935,67 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                         # self.logger.debug('flux.shape '+str(flux.shape))
                         # self.logger.debug('vel.shape '+str(vel.shape))
                         # self.logger.debug('disp.shape '+str(disp.shape))
-                        data_mask2d = None
-                        if gal.data.mask is not None:
-                            if len(gal.data.mask.shape) == 3:
-                                data_mask2d = np.any(gal.data.mask>0, axis=0).astype(int)
+                        # 20250827 debugging
+                        #print('gal.data2d = data_classes.Data2D(...)')
+                        #fits.PrimaryHDU(scube).writeto('tmp.gal.data.data.fits', overwrite=True)
+                        #fits.PrimaryHDU(flux).writeto('tmp.data2d.flux.fits', overwrite=True)
+                        #fits.PrimaryHDU(vel).writeto('tmp.data2d.vel.fits', overwrite=True)
+                        #fits.PrimaryHDU(disp).writeto('tmp.data2d.disp.fits', overwrite=True)
                         gal.data2d = data_classes.Data2D(
                             pixscale = gal.instrument.pixscale.value,
                             flux = flux, velocity = vel, vel_disp = disp, mask = data_mask2d,
-                            vel_err = None, vel_disp_err = None, flux_err = None,
+                            flux_err = None, vel_err = None, vel_disp_err = None, 
                             smoothing_type = gal.data.smoothing_type,
                             smoothing_npix = gal.data.smoothing_npix,
                             inst_corr = False, moment = False,
                             xcenter = gal.data.xcenter,
                             ycenter = gal.data.ycenter,
                         )
-                    #
-                    if hasattr(gal, 'data1d') and gal.data1d is not None:
                         self.data_flux_map = gal.data2d.data['flux']
                         self.data_vel_map = gal.data2d.data['velocity']
                         self.data_disp_map = gal.data2d.data['dispersion']
-                    else:
-                        # gal.data1d = extract_1D_from_cube(
-                        #     gal.data.data, gal,
-                        #     errcube = gal.data.error,
-                        #     slit_width = slit_width, slit_pa = slit_pa,
-                        #     aper_dist = aper_dist,
-                        #     moment = False, inst_corr = inst_corr, fill_mask = fill_mask)
-                        # gal.data1d = plotting.extract_1D_from_cube(
-                        #     gal.data.data, gal, slit_width = slit_width,
-                        #     slit_pa = slit_pa, aper_dist = aper_dist, moment = True,
-                        #     inst_corr = inst_corr, fill_mask = fill_mask)
-                        pass
+                    #
+                    # if hasattr(gal, 'data1d') and gal.data1d is not None:
+                    #     # TODO
+                    #     raise NotImplementedError()
+                    #     self.data_flux_map = gal.data2d.data['flux']
+                    #     self.data_vel_map = gal.data2d.data['velocity']
+                    #     self.data_disp_map = gal.data2d.data['dispersion']
+                    #     if hasattr(gal.data2d, 'error'):
+                    #         self.data_flux_err_map = gal.data2d.error['flux']
+                    #         self.data_vel_err_map = gal.data2d.error['velocity']
+                    #         self.data_disp_err_map = gal.data2d.error['dispersion']
+                    # else:
+                    #     # gal.data1d = extract_1D_from_cube(
+                    #     #     gal.data.data, gal,
+                    #     #     errcube = gal.data.error,
+                    #     #     slit_width = slit_width, slit_pa = slit_pa,
+                    #     #     aper_dist = aper_dist,
+                    #     #     moment = False, inst_corr = inst_corr, fill_mask = fill_mask)
+                    #     # gal.data1d = plotting.extract_1D_from_cube(
+                    #     #     gal.data.data, gal, slit_width = slit_width,
+                    #     #     slit_pa = slit_pa, aper_dist = aper_dist, moment = True,
+                    #     #     inst_corr = inst_corr, fill_mask = fill_mask)
+                    #     pass
                 elif gal.data.ndim == 2:
+                    print('gal.data.data.keys()', gal.data.data.keys())
                     self.data_flux_map = gal.data.data['flux']
                     self.data_vel_map = gal.data.data['velocity']
                     self.data_disp_map = gal.data.data['dispersion']
                     self.data_mask_map = gal.data.mask
+                    if hasattr(gal.data, 'error'):
+                        self.data_flux_err_map = gal.data.error['flux']
+                        self.data_vel_err_map = gal.data.error['velocity']
+                        self.data_disp_err_map = gal.data.error['dispersion']
+                    #if 'vel_shift' in params: # 20230913
+                    #    self.data_vel_map -= params['vel_shift']
+                # 
+                if self.data_mask_map is None: # 20250827
+                    if self.data_flux_map is not None: # 20250827
+                        self.data_mask_map = np.full(self.data_flux_map.shape, fill_value=True) # 20250827
+                    elif self.data_vel_map is not None: # 20250827
+                        self.data_mask_map = np.full(self.data_vel_map.shape, fill_value=True) # 20250827
+                # 
                 if self.data_flux_map is not None:
                     nan_mask = np.invert(self.data_mask_map) # (self.data_flux_map < -9.99999e5)
                     if np.count_nonzero(nan_mask)>0:
@@ -4145,6 +5008,18 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                     nan_mask = np.invert(self.data_mask_map) # (self.data_disp_map < -9.99999e5)
                     if np.count_nonzero(nan_mask)>0:
                         self.data_disp_map[nan_mask] = np.nan
+                if self.data_flux_err_map is not None:
+                    nan_mask = np.invert(self.data_mask_map) # (self.data_flux_err_map < -9.99999e5)
+                    if np.count_nonzero(nan_mask)>0:
+                        self.data_flux_err_map[nan_mask] = np.nan
+                if self.data_vel_err_map is not None:
+                    nan_mask = np.invert(self.data_mask_map) # (self.data_vel_err_map < -9.99999e5)
+                    if np.count_nonzero(nan_mask)>0:
+                        self.data_vel_err_map[nan_mask] = np.nan
+                if self.data_disp_err_map is not None:
+                    nan_mask = np.invert(self.data_mask_map) # (self.data_disp_err_map < -9.99999e5)
+                    if np.count_nonzero(nan_mask)>0:
+                        self.data_disp_err_map[nan_mask] = np.nan
                 if self.data_flux_map is not None:
                     if self.data_flux_map.shape == self.model_flux_map.shape:
                         self.residual_flux_map = self.data_flux_map - self.model_flux_map
@@ -4157,6 +5032,7 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
                 #
                 self.send_data_to_queue(
                         ['data_flux_map', 'data_vel_map', 'data_disp_map', 'data_mask_map', 
+                         'data_flux_err_map', 'data_vel_err_map', 'data_disp_err_map', 
                          'residual_flux_map', 'residual_vel_map', 'residual_disp_map']
                     )
         #
@@ -4173,27 +5049,30 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         self.log_message('Generating rotation curves...')
         #
         if params is None:
-            self.log_message('Error! DysmalPyParams is invalid! ' +
-                             'Could not proceed to generate the rotation curve. ' +
-                             'Please set DysmalPyFittingWorker.DysmalPyParams first!')
+            err_msg = 'Error! DysmalPyParams is invalid! ' + \
+                      'Could not proceed to generate the rotation curve. ' + \
+                      'Please set DysmalPyFittingWorker.DysmalPyParams first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         if gal is None:
             gal = self.gal
         if gal is None:
-            self.log_message('Error! DysmalPyGal is invalid! ' +
-                             'Could not proceed to generate the rotation curve. ' +
-                             'Please run DysmalPyFittingWorker.generateModelCube first!')
+            err_msg = 'Error! DysmalPyGal is invalid! ' + \
+                      'Could not proceed to generate the rotation curve. ' + \
+                      'Please run DysmalPyFittingWorker.generateModelCube first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         if gal.model_cube is None:
-            self.log_message('Error! DysmalPyGal.model_cube is invalid! ' +
-                             'Could not proceed to generate the rotation curve. ' +
-                             'Please run DysmalPyFittingWorker.generateModelCube first!')
+            err_msg = 'Error! DysmalPyGal.model_cube is invalid! ' + \
+                      'Could not proceed to generate the rotation curve. ' + \
+                      'Please run DysmalPyFittingWorker.generateModelCube first!'
+            self.log_message(err_msg)
             if not block_signal:
-                self.emit_finished_with_error()
+                self.emit_finished_with_error(err_msg)
             return
         #
         self.data_flux_curve = None
@@ -4206,11 +5085,10 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         #
         kwargs_galmodel = setup_lensing_dict(params)
         kwargs_galmodel['lensing_transformer'] = self.lensing_transformer
-        #kwargs_galmodel['gauss_extract_with_c']
-        for key in ['moment_calc', 'gauss_extract_with_c']:
+        for key in ['moment_calc', 'gauss_extract_with_c', 'zcalc_truncate', 'zcalc_with_c']:
             if key in params:
                 kwargs_galmodel[key] = params[key] #20211111
-                print(f'kwargs_galmodel[{key!r}] = params[{key!r}]') #20211111 DEBUG
+                print(f'kwargs_galmodel[{key!r}] = params[{key!r}] = {params[key]!r}') #20211111 DEBUG
         #
         # Get 1d flux, vel and disp from model.
         # If input data is 1d, i.e., having 'fdata' in params, then we can directly use the
@@ -4219,141 +5097,310 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         # otherwise we create a copy of dymalpy.galaxy object, then use the
         #   dymalpy.galaxy.create_model_data(ndim_final=1, from_data=False, from_instrument=True)
         # function.
-        if 'fdata' in params:
-            self.log_message('Computing rotation velocity profile along the data slit at PA ')+str(gal.data.slit_pa)
-            gal.create_model_data(ndim_final=1,
-                                  from_data=True,
-                                  **kwargs_galmodel,
-                                 )
-            self.data_flux_curve  = {'x':gal.data.rarr,
-                                     'y':gal.data.data['flux'],
-                                     'yerr':gal.data.error['flux'],
-                                     'marker':'o', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7, 'capsize':2}
-            self.data_vel_curve   = {'x':gal.data.rarr,
-                                     'y':gal.data.data['velocity'],
-                                     'yerr':gal.data.error['velocity'],
-                                     'marker':'o', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7, 'capsize':2}
-            self.data_disp_curve  = {'x':gal.data.rarr,
-                                     'y':gal.data.data['dispersion'],
-                                    'yerr':gal.data.error['dispersion'],
-                                    'marker':'o', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7, 'capsize':2}
-            self.model_flux_curve = {'x':gal.model_data.rarr,
-                                     'y':gal.model_data.data['flux'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7}
-            self.model_vel_curve  = {'x':gal.model_data.rarr,
-                                     'y':gal.model_data.data['velocity'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7}
-            self.model_disp_curve = {'x':gal.model_data.rarr,
-                                     'y':gal.model_data.data['dispersion'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none',
-                                     'linestyle':'none', 'alpha':0.7}
-            if 'inst_corr' in gal.data.data.keys():
-                inst_corr = gal.data.data['inst_corr']
+        # 
+        # 20250827 
+        # In new dysmalpy, there is no 'create_model_data', we need to use 'create_single_obs_model_data'
+        # 
+        # get data 1d and instrument 1d object in new dysmalpy 20250827
+        self.log_message('Computing rotation velocity profile along the data slit at PA '+str(params['slit_pa']))
+        if 'fdata' in params: # the data is already 1D data
+            gal_data = obs.data
+            gal_model_data = obs.model_data
+            data_1d = obs.data
+            instrument_1d = obs.instrument
         else:
-            if 'slit_width' not in params:
-                params['slit_width'] = 0.2 #<TODO>#
-            if 'slit_pa' not in params:
-                params['slit_pa'] = 45. #<TODO>#
-            slit_width = params['slit_width']
-            slit_pa = params['slit_pa']
-            oversample = params['oversample']
-            oversize = params['oversize']
-            if slit_pa is None or slit_width is None:
-                self.log_message('Error! Invalid slit_width or slit_pa. ' +
-                                'Could not proceed to generate the rotation curves.')
-                if not block_signal:
-                    self.emit_finished_with_error()
-                return
+            # the data is 2D or 3D, we need to measure 1D profile for the data
+            # extract 1D profiles from the 2D data
+            naper = 35
+            fov_npix = params['fov_npix']
+            pixscale = params['pixscale']
+            if 'slit_width' in params:
+                slit_width = params['slit_width']
+            else:
+                slit_width = 0.2 #<TODO># arcsec
+            # 
+            if 'slit_pa' in params:
+                slit_pa = params['slit_pa']
+            else:
+                slit_pa = 45. #<TODO># degree
+            # 
             if 'profile1d_type' in params:
                 profile1d_type = params['profile1d_type']
             else:
-                profile1d_type = 'circ_ap_pv'
+                profile1d_type = 'rect_ap_cube'
+            # 
             if 'aperture_radius' in params:
-                aperture_radius = params['aperture_radius'] # if profile1d_type == 'circ_ap_cube'
+                aperture_radius = params['aperture_radius']
             else:
-                aperture_radius = 0.1
-            pixscale = params['pixscale']
-            fov_npix = params['fov_npix']
-            xcenter = params['xcenter']
-            ycenter = params['ycenter']
-            aper_centers = np.linspace(-np.abs(fov_npix*pixscale/2.0), +np.abs(fov_npix*pixscale/2.0), num=35, endpoint=True) # in arcsec
-            this_DysmalPyGal = copy.copy(gal)
-            if this_DysmalPyGal.data is not None:
-                this_DysmalPyGal.data.aper_center_pix_shift = None
-            self.log_message('Computing rotation velocity profile along the assumed slit at PA '+str(slit_pa))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.model.line_center = '+str(this_DysmalPyGal.model.line_center))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.spec_type = '+str(this_DysmalPyGal.instrument.spec_type))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.spec_start.value = '+str(this_DysmalPyGal.instrument.spec_start.value))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.spec_step.value = '+str(this_DysmalPyGal.instrument.spec_step.value))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.spec_start.unit = '+str(this_DysmalPyGal.instrument.spec_start.unit))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.pixscale.value (rstep) = '+str(this_DysmalPyGal.instrument.pixscale.value))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.nspec = '+str(this_DysmalPyGal.instrument.nspec))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.fov[0] = '+str(this_DysmalPyGal.instrument.fov[0]))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.fov[1] = '+str(this_DysmalPyGal.instrument.fov[1]))
-            #self.logger.debug('generateRotationCurves: this_DysmalPyGal.instrument.slit_width = '+str(this_DysmalPyGal.instrument.slit_width))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.dscale = '+str(this_DysmalPyGal.dscale))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.slit_width = '+str(slit_width))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.slit_pa = '+str(slit_pa))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.profile1d_type = '+str(profile1d_type))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.aperture_radius = '+str(aperture_radius))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.aper_centers = '+str(aper_centers))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.oversample = '+str(oversample))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.oversize = '+str(oversize))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.xcenter = '+str(xcenter))
-            self.logger.debug('generateRotationCurves: this_DysmalPyGal.ycenter = '+str(ycenter))
-            this_DysmalPyGal.create_model_data(ndim_final=1, from_data=False, from_instrument=True,
-                                               slit_width = slit_width,
-                                               slit_pa = slit_pa,
-                                               profile1d_type = profile1d_type,
-                                               aperture_radius = aperture_radius,
-                                               aper_centers = aper_centers,
-                                               oversample = oversample,
-                                               oversize = oversize,
-                                               xcenter = xcenter,
-                                               ycenter = ycenter,
-                                               **kwargs_galmodel,
-                                               )
-            #logger.debug('this_DysmalPyGal.model_data.rarr: '+str(this_DysmalPyGal.model_data.rarr))
-            #logger.debug('this_DysmalPyGal.model_data.data: '+str(this_DysmalPyGal.model_data.data))
-            #aper_model = aperture_classes.setup_aperture_types(gal=this_DysmalPyGal,
-            #            profile1d_type=profile1d_type,
-            #            slit_width = slit_width,
-            #            aper_centers=aper_centers,
-            #            slit_pa=slit_pa,
-            #            aperture_radius=aperture_radius,
-            #            pix_perp=None,
-            #            pix_parallel=None,
-            #            pix_length=None,
-            #            partial_weight=False,
-            #            from_data=False)
-            #aper_centers, flux1d, vel1d, disp1d = aper_model.extract_1d_kinematics(spec_arr=vel_arr,
-            #        cube=cube_data, center_pixel = center_pixel,
-            #        pixscale=rstep)
-            #self.model_data = Data1D(r=aper_centers, velocity=vel1d,
-            #                         vel_disp=disp1d, flux=flux1d, mask=None,
-            #                         slit_width=slit_width, slit_pa=slit_pa)
-            self.model_flux_curve = {'x':this_DysmalPyGal.model_data.rarr,
-                                     'y':this_DysmalPyGal.model_data.data['flux'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none', 'linestyle':'none', 'alpha':0.7}
-            self.model_vel_curve  = {'x':this_DysmalPyGal.model_data.rarr,
-                                     'y':this_DysmalPyGal.model_data.data['velocity'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none', 'linestyle':'none', 'alpha':0.7}
-            self.model_disp_curve = {'x':this_DysmalPyGal.model_data.rarr,
-                                     'y':this_DysmalPyGal.model_data.data['dispersion'],
-                                     'marker':'s', 'markersize':5, 'markeredgecolor':'none', 'linestyle':'none', 'alpha':0.7}
+                aperture_radius = float(slit_width / 2.0) # arcsec
+            # 
+            if 'pix_perp' in params:
+                pix_perp = params['pix_perp']
+            else:
+                pix_perp = float(slit_width / pixscale)
+            # 
+            if 'pix_parallel' in params:
+                pix_parallel = params['pix_parallel']
+            else:
+                pix_parallel = 1
+            # 
+            if 'pix_length' in params:
+                pix_length = params['pix_length']
+            else:
+                pix_length = int(np.ceil(slit_width / pixscale))
+            # 
+            if 'xcenter' in params:
+                xcenter = params['xcenter']
+            else:
+                xcenter = None
+            # 
+            if 'ycenter' in params:
+                ycenter = params['ycenter']
+            else:
+                ycenter = None
+            # 
+            if slit_pa is None or slit_width is None:
+                err_msg = 'Error! Invalid slit_width or slit_pa. ' + \
+                          'Could not proceed to generate the rotation curves.'
+                self.log_message(err_msg)
+                if not block_signal:
+                    self.emit_finished_with_error(err_msg)
+                return
+            # 
+            fov_arcsec = np.abs(fov_npix*pixscale)
+            aper_centers = np.linspace(-fov_arcsec/2.0, fov_arcsec/2.0, num=naper, endpoint=True) # in arcsec
+            # 
+            # prepare output arrays
+            data_aper_fluxes = np.full(naper, fill_value=np.nan)
+            data_aper_vels = np.full(naper, fill_value=np.nan)
+            data_aper_disps = np.full(naper, fill_value=np.nan)
+            data_aper_flux_errors = np.full(naper, fill_value=np.nan)
+            data_aper_vel_errors = np.full(naper, fill_value=np.nan)
+            data_aper_disp_errors = np.full(naper, fill_value=np.nan)
+            model_aper_fluxes = np.full(naper, fill_value=np.nan)
+            model_aper_vels = np.full(naper, fill_value=np.nan)
+            model_aper_disps = np.full(naper, fill_value=np.nan)
+            # 
+            # extract 1D from 2D
+            if xcenter is None:
+                xcenter = (fov_npix-1.)/2.
+            if ycenter is None:
+                ycenter = (fov_npix-1.)/2.
+            ygrid, xgrid = np.mgrid[0:fov_npix, 0:fov_npix]
+            xvec = np.arange(fov_npix)
+            yvec = np.arange(fov_npix)
+            rect_height = pix_parallel
+            rect_width = pix_perp
+            rect_b_a_angle = np.arctan2(rect_height/2.0, rect_width/2.0) # degree
+            rect_half_diagonal = np.sqrt((rect_height/2.0)**2 + (rect_width/2.0)**2) # arcsec
+            rect_angle = slit_pa+90.+180. # rect_width, rect_height, rect_angle (up from +x), 
+            if rect_angle > 180.:
+                rect_angle -= 360.
+            if rect_angle < -180.:
+                rect_angle += 360.
+            aper_centers_blue_to_red = aper_centers
+            aper_rarr = aper_centers_blue_to_red
+            # -180. accounts for the fact that we want apertures to scan from blue to red, 
+            # but DysmalPy defines PA as the blue side direction from North.  
+            for iaper in range(naper):
+                xpos = aper_centers_blue_to_red[iaper] * np.cos(np.deg2rad(rect_angle)) / pixscale + xcenter
+                ypos = aper_centers_blue_to_red[iaper] * np.sin(np.deg2rad(rect_angle)) / pixscale + ycenter
+                if profile1d_type == 'circ_ap_cube' or profile1d_type == 'circ_ap_pv':
+                    # circular apertures
+                    grid_mask = (np.sqrt((xgrid-xpos)**2 + (ygrid-ypos)**2) <= (aperture_radius / pixscale)) # True for inside the circlar aperture
+                elif profile1d_type == 'single_pix_pv':
+                    # single-pixel apertures
+                    grid_mask = np.full(xgrid.shape, fill_value=False)
+                    xposi, yposi = int(np.round(xpos)), int(np.round(ypos))
+                    if xposi >= 0 and xposi <= fov_npix-1 and \
+                       yposi >= 0 and yposi <= fov_npix-1 :
+                        grid_mask[yposi, xposi] = True
+                else:
+                    # rectangle apertures
+                    angle11 = np.deg2rad(rect_angle+90.+rect_b_a_angle)
+                    angle12 = np.deg2rad(rect_angle+90.-rect_b_a_angle)
+                    angle22 = np.deg2rad(rect_angle-90.+rect_b_a_angle)
+                    angle21 = np.deg2rad(rect_angle-90.-rect_b_a_angle)
+                    xpos11 = xpos + rect_half_diagonal * np.cos(angle11) / pixscale
+                    ypos11 = ypos + rect_half_diagonal * np.sin(angle11) / pixscale
+                    xpos12 = xpos + rect_half_diagonal * np.cos(angle12) / pixscale
+                    ypos12 = ypos + rect_half_diagonal * np.sin(angle12) / pixscale
+                    xpos22 = xpos + rect_half_diagonal * np.cos(angle22) / pixscale
+                    ypos22 = ypos + rect_half_diagonal * np.sin(angle22) / pixscale
+                    xpos21 = xpos + rect_half_diagonal * np.cos(angle21) / pixscale
+                    ypos21 = ypos + rect_half_diagonal * np.sin(angle21) / pixscale
+                    #if iaper == naper//2:
+                    #    print('dzliu debugging: xcenter, ycenter:', 
+                    #          (xcenter, ycenter))
+                    #    print('dzliu debugging: xpos11, ypos11, xpos12, ypos12, xpos22, ypos22, xpos21, ypos21:', 
+                    #          (xpos11, ypos11), (xpos12, ypos12), (xpos22, ypos22), (xpos21, ypos21))
+                    # test point in rectangle, test point at the right side of each line from (1,1)-(1,2)-(2,2)-(2,1)
+                    # xpos12, ypos12, xpos11, ypos11, xgrid, ygrid = 5, 5, 4, 4, 5, 4
+                    grid_mask = np.full(xgrid.shape, fill_value=False) # True for outside the aper step rect
+                    for checkpoints in [ [ (xpos11,ypos11), (xpos12,ypos12) ], 
+                                         [ (xpos12,ypos12), (xpos22,ypos22) ], 
+                                         [ (xpos22,ypos22), (xpos21,ypos21) ], 
+                                         [ (xpos21,ypos21), (xpos11,ypos11) ] ]:
+                        checkpoint_a, checkpoint_b = checkpoints
+                        xa, ya = checkpoint_a
+                        xb, yb = checkpoint_b
+                        check_mask = ((xb-xa)*(ygrid-ya) - (yb-ya)*(xgrid-xa) < 0.0) # (xgrid,ygrid) is at the left side of line (xa,ya)-(xb,yb)
+                        grid_mask = np.logical_or(grid_mask, check_mask)
+                    grid_mask = np.invert(grid_mask) # now True for inside the rect
+                    # # 
+                    # #if iaper == naper//2:
+                    # #    print('dzliu debugging: np.count_nonzero(check_mask):', 
+                    # #          np.count_nonzero(check_mask))
+                    # if np.count_nonzero(grid_mask) == 0:
+                    #     xposi, yposi = int(np.round(xpos)), int(np.round(ypos))
+                    #     if xposi >= 0 and xposi <= fov_npix-1 and \
+                    #        yposi >= 0 and yposi <= fov_npix-1 :
+                    #         grid_mask[yposi, xposi] = True
+                # 
+                if np.count_nonzero(grid_mask) > 0:
+                    has_data_1d_measure = False
+                    if self.data_flux_map is not None:
+                        data_aper_fluxes[iaper] = np.nanmean(self.data_flux_map[grid_mask])
+                        has_data_1d_measure = True
+                    if self.data_vel_map is not None:
+                        data_aper_vels[iaper] = np.nanmean(self.data_vel_map[grid_mask])
+                        has_data_1d_measure = True
+                    if self.data_disp_map is not None:
+                        data_aper_disps[iaper] = np.nanmean(self.data_disp_map[grid_mask])
+                        has_data_1d_measure = True
+                    if self.data_flux_err_map is not None:
+                        data_aper_flux_errors[iaper] = np.nanmean(self.data_flux_err_map[grid_mask])
+                        has_data_1d_measure = True
+                    if self.data_vel_err_map is not None:
+                        data_aper_vel_errors[iaper] = np.nanmean(self.data_vel_err_map[grid_mask])
+                        has_data_1d_measure = True
+                    if self.data_disp_err_map is not None:
+                        data_aper_disp_errors[iaper] = np.nanmean(self.data_disp_err_map[grid_mask])
+                        has_data_1d_measure = True
+                    # 
+                    has_model_1d_measure = False
+                    if self.model_flux_map is not None:
+                        model_aper_fluxes[iaper] = np.nanmean(self.model_flux_map[grid_mask])
+                        has_model_1d_measure = True
+                    if self.model_vel_map is not None:
+                        model_aper_vels[iaper] = np.nanmean(self.model_vel_map[grid_mask])
+                        has_model_1d_measure = True
+                    if self.model_disp_map is not None:
+                        model_aper_disps[iaper] = np.nanmean(self.model_disp_map[grid_mask])
+                        has_model_1d_measure = True
+                    # 
+                    if not has_data_1d_measure:
+                        if self.data_cube is not None:
+                            spec_axis = self.data_cube.spectral_axis.to(u.km/u.s).value
+                            spec_flux = np.array([np.nanmean(chanimg[grid_mask]) for chanimg in self.data_cube._data])
+                            spec_mom0 = np.abs(np.nanmean(spec_flux))
+                            spec_mom1 = np.nansum(spec_flux*spec_axis)/np.nansum(spec_flux)
+                            spec_mom2 = np.sqrt(np.abs(np.nansum(spec_flux*spec_axis**2)/np.nansum(spec_flux)))
+                            best_fit = gaus_fit_sp_opt_leastsq(spec_axis, spec_flux, 
+                                spec_mom0 / np.sqrt(2 * np.pi) / np.abs(spec_mom2), spec_mom1, spec_mom2)
+                            data_aper_fluxes[iaper] = best_fit[0] * np.sqrt(2 * np.pi) * best_fit[2]
+                            data_aper_vels[iaper] = best_fit[1]
+                            data_aper_disps[iaper] = best_fit[2]
+                            data_aper_flux_errors[iaper] = np.abs(data_aper_fluxes[iaper]) * 0.1 # TODO: error for the spec 1d
+                            data_aper_vel_errors[iaper] = 5.0 # TODO: error for the spec 1d
+                            data_aper_disp_errors[iaper] = 5.0 # TODO: error for the spec 1d
+                    # 
+                    if not has_model_1d_measure:
+                        if self.model_cube is not None:
+                            spec_axis = self.model_cube.spectral_axis.to(u.km/u.s).value
+                            spec_flux = np.array([np.nanmean(chanimg[grid_mask]) for chanimg in self.model_cube._data])
+                            spec_mom0 = np.abs(np.nanmean(spec_flux))
+                            spec_mom1 = np.nansum(spec_flux*spec_axis)/np.nansum(spec_flux)
+                            spec_mom2 = np.sqrt(np.abs(np.nansum(spec_flux*spec_axis**2)/np.nansum(spec_flux)))
+                            best_fit = gaus_fit_sp_opt_leastsq(spec_axis, spec_flux, spec_mom0, spec_mom1, spec_mom2)
+                            model_aper_fluxes[iaper] = best_fit[0] * np.sqrt(2 * np.pi) * best_fit[2]
+                            model_aper_vels[iaper] = best_fit[1]
+                            model_aper_disps[iaper] = best_fit[2]
+                
+                # # extract 1D from 3D
+                # DummyObs = namedtuple('DummyObs', ['instrument', 'obs_options'])
+                # DummyInst = namedtuple('DummyInst', ['pixscale', 'fov', 'moment'])
+                # DummyOpts = namedtuple('DummyOpts', ['xcenter', 'ycenter'])
+                # dummy_inst = DummyInst(pixscale, [fov_npix, fov_npix], params['moment_calc'])
+                # dummy_opts = DummyOpts(params['xcenter'], params['ycenter'])
+                # dummy_obs = DummyObs(dummy_inst, dummy_opts)
+
+                # apertures = aperture_classes.setup_aperture_types( # 20250827 new dysmalpy
+                #     obs=dummy_obs,
+                #     profile1d_type=profile1d_type,
+                #     aper_centers=aper_centers,
+                #     aperture_radius=aperture_radius,
+                #     slit_pa=slit_pa,
+                #     slit_width=slit_width,
+                #     pix_perp=pix_perp, 
+                #     pix_parallel=pix_parallel,
+                #     partial_weight=partial_weight,
+                # )
+
+                # aper_centers, flux1d, vel1d, disp1d = apertures.extract_1d_kinematics(
+                #     spec_arr=vel_arr,
+                #     cube=data_scaled, mask=mask, err=ecube,
+                #     center_pixel = center_pixel, pixscale=pixscale,
+                # )
+                # aper_fluxes = flux1d.data
+                # aper_flux_errors = flux1d.error
+                # aper_vels = vel1d.data
+                # aper_vel_errors = vel1d.error
+                # aper_disps = disp1d.data
+                # aper_disp_errors = disp1d.error
+        # 
+        if 'data_inst_corr' in params:
+            inst_corr = params['data_inst_corr']
+        else:
+            inst_corr = False
+        gal_data = data_classes.Data1D(r=aper_centers, velocity=data_aper_vels, vel_err=data_aper_vel_errors, 
+            vel_disp=data_aper_disps, vel_disp_err=data_aper_disp_errors, 
+            flux=data_aper_fluxes, flux_err=data_aper_flux_errors, 
+            inst_corr=inst_corr)
+        gal_model_data = data_classes.Data1D(r=aper_centers, velocity=model_aper_vels, 
+            vel_disp=model_aper_disps, 
+            flux=model_aper_fluxes, 
+            inst_corr=inst_corr)
+        # 
+        self.data_flux_curve  = {'x':gal_data.rarr,
+                                 'y':gal_data.data['flux'],
+                                 'yerr':gal_data.error['flux'],
+                                 'marker':'o', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7, 'capsize':2}
+        self.data_vel_curve   = {'x':gal_data.rarr,
+                                 'y':gal_data.data['velocity'],
+                                 'yerr':gal_data.error['velocity'],
+                                 'marker':'o', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7, 'capsize':2}
+        self.data_disp_curve  = {'x':gal_data.rarr,
+                                 'y':gal_data.data['dispersion'],
+                                'yerr':gal_data.error['dispersion'],
+                                'marker':'o', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7, 'capsize':2}
+        self.model_flux_curve = {'x':gal_model_data.rarr,
+                                 'y':gal_model_data.data['flux'],
+                                 'marker':'s', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7}
+        self.model_vel_curve  = {'x':gal_model_data.rarr,
+                                 'y':gal_model_data.data['velocity'],
+                                 'marker':'s', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7}
+        self.model_disp_curve = {'x':gal_model_data.rarr,
+                                 'y':gal_model_data.data['dispersion'],
+                                 'marker':'s', 'markersize':5, 'markeredgecolor':'none',
+                                 'linestyle':'none', 'alpha':0.7}
+        
+        # if 'inst_corr' in gal_data.data.keys():
+        #     inst_corr = gal_data.data['inst_corr']
         if inst_corr:
             try:
-                lsf_dispersion = this_DysmalPyGal.instrument.lsf.dispersion
+                lsf_dispersion = gal_instrument.lsf.dispersion
             except:
                 self.log_message('LSF dispersion not defined. Will not do inst_corr.')
                 inst_corr = False
         if inst_corr:
             self.model_disp_curve['y'] = np.sqrt( self.model_disp_curve['y']**2 - lsf_dispersion.to(u.km/u.s).value**2 )
+            self.log_message('LSF correction done.')
             # see "dysmalpy/plotting.py" def plot_data_model_comparison_1D
         #
         self.send_data_to_queue(
@@ -4366,6 +5413,8 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         if not block_signal:
             self.emit_finished()
     
+    # 
+    #def more
 
 
 
@@ -4387,10 +5436,12 @@ class QWidgetForParamInput(QWidget):
     
     def __init__(self,
             keyname, keyvalue=None, keycomment='', datatype=str, listtype=str,
-            default=None, options=None, checkbox=False, readonly=False,
-            fullwidth=False, isdatadir=False, defaultdir=None, isdatafile=False, namefilter=None, isoutdir=False,
-            enabled=True,
-            parent=None
+            default=None, options=None, checkbox=False, 
+            fullwidth=False, # whether this widget span the whole width. in default it is half width.
+            isdatadir=False, defaultdir=None, isdatafile=False, namefilter=None, isoutdir=False,
+            readonly=False, enabled=True, 
+            associatedparams=None, 
+            parent=None,
         ):
         super(QWidgetForParamInput, self).__init__()
         self.ParamName = keyname
@@ -4398,7 +5449,7 @@ class QWidgetForParamInput(QWidget):
         self.ParamComment = keycomment
         self.ParamDefaultValue = default
         self.ParamDataType = datatype
-        self.ParamListType = listtype
+        self.ParamListType = listtype # indicate whether the value should be a list or not. listtype == list.
         self.ParamRegExpValidator = ''
         self.LabelText = keyname
         self.IsFullWidth = fullwidth
@@ -4408,6 +5459,7 @@ class QWidgetForParamInput(QWidget):
         self.NameFilter = namefilter
         self.DefaultDirectory = defaultdir if defaultdir is not None else os.getcwd()
         self.RestrictedToDirectory = None
+        self.AssociatedParams = associatedparams
         self.IndexInWidgetGrid = -1
         self.LabelWidget = None
         self.LineEditWidget = None
@@ -5116,7 +6168,7 @@ class QFitsImageWidget(FigureCanvasQTAgg):
         self.dataimagewcs = data_image_wcs
     
     def showImage(self,
-            image=None, cmap='viridis', extent=None, vmin=None, vmax=None,
+            image=None, cmap=None, extent=None, vmin=None, vmax=None,
             selected_pixel=None, selected_pixel_color='k', selected_pixel_alpha=0.9, selected_pixel_linewidth=1.5,
             selected_polygon=None, selected_polygon_color='k', selected_polygon_alpha=0.9, selected_polygon_linewidth=1.5,
             selected_polygon_closed=True,
@@ -5146,6 +6198,10 @@ class QFitsImageWidget(FigureCanvasQTAgg):
             if self.slit is not None:
                 self.slit.remove()
                 self.slit = None
+        # set default cmap
+        if cmap is None:
+            #cmap = 'viridis' # 2022-08-25
+            cmap = get_QFitsView_colormap_rainbow()
         # show image
         if image is not None:
             self.dataimage = image
@@ -5684,6 +6740,7 @@ class QSpectrumWidget(FigureCanvasQTAgg):
         self.PreviouslySelectedChannel = None
         self.PlottedChannel = [] # must be a list
         self.PlottedChunk = [] # must be a list
+        self.HasLegend = False
         # setup matplotlib figure
         self.fig = Figure(figsize=(width, height), tight_layout=tight_layout)
         self.axes = self.fig.add_subplot(111)
@@ -5868,6 +6925,16 @@ class QSpectrumWidget(FigureCanvasQTAgg):
         self.draw()
         return True
     
+    def plotLegend(self, loc='upper left'):
+        if self.axes:
+            if not self.HasLegend:
+                self.axes.legend(loc=loc)
+                self.HasLegend = True
+                # update canvas
+                self.draw()
+            return True
+        return False
+    
     def setSelectedChannel(self, ichan):
         if self.axes is not None and self.xarray is not None and self.yarray is not None:
             # highlight selected channel
@@ -5967,6 +7034,275 @@ class QSpectrumWidget(FigureCanvasQTAgg):
 
 
 
+# 
+# DS9 Colormap SLS
+# 
+def get_QFitsView_colormap_rainbow(bad='#dedede'):
+    cmaprgb = np.array([
+    [0.00000, 0.00000, 0.16471], 
+    [0.02745, 0.00000, 0.18431], 
+    [0.05882, 0.00000, 0.20000], 
+    [0.08627, 0.00000, 0.21961], 
+    [0.11373, 0.00000, 0.23922], 
+    [0.14510, 0.00000, 0.25882], 
+    [0.17647, 0.00000, 0.27843], 
+    [0.20392, 0.00000, 0.29804], 
+    [0.23137, 0.00000, 0.31765], 
+    [0.26275, 0.00000, 0.33725], 
+    [0.29412, 0.00000, 0.35686], 
+    [0.32157, 0.00000, 0.37647], 
+    [0.35294, 0.00000, 0.39608], 
+    [0.38039, 0.00000, 0.41569], 
+    [0.41176, 0.00000, 0.43529], 
+    [0.43922, 0.00000, 0.45490], 
+    [0.47059, 0.00000, 0.47451], 
+    [0.49804, 0.00000, 0.49412], 
+    [0.52941, 0.00000, 0.51373], 
+    [0.55686, 0.00000, 0.53725], 
+    [0.58824, 0.00000, 0.55686], 
+    [0.55686, 0.00000, 0.57647], 
+    [0.52941, 0.00000, 0.59608], 
+    [0.49804, 0.00000, 0.61569], 
+    [0.47059, 0.00000, 0.63922], 
+    [0.43922, 0.00000, 0.65882], 
+    [0.41176, 0.00000, 0.67843], 
+    [0.38039, 0.00000, 0.70196], 
+    [0.35294, 0.00000, 0.72157], 
+    [0.32157, 0.00000, 0.74118], 
+    [0.29412, 0.00000, 0.76471], 
+    [0.26275, 0.00000, 0.78431], 
+    [0.23137, 0.00000, 0.80392], 
+    [0.20392, 0.00000, 0.82745], 
+    [0.17647, 0.00000, 0.84706], 
+    [0.14510, 0.00000, 0.87059], 
+    [0.11373, 0.00000, 0.89020], 
+    [0.08627, 0.00000, 0.91373], 
+    [0.05882, 0.00000, 0.93333], 
+    [0.02745, 0.00000, 0.95686], 
+    [0.00000, 0.00000, 0.97647], 
+    [0.00000, 0.00000, 1.00000], 
+    [0.00000, 0.02353, 0.97647], 
+    [0.00000, 0.04706, 0.95686], 
+    [0.00000, 0.06275, 0.93333], 
+    [0.00000, 0.08235, 0.91373], 
+    [0.00000, 0.09804, 0.89020], 
+    [0.00000, 0.11373, 0.87059], 
+    [0.00000, 0.12941, 0.84706], 
+    [0.00000, 0.14118, 0.82745], 
+    [0.00000, 0.15686, 0.80392], 
+    [0.00000, 0.16863, 0.78431], 
+    [0.00000, 0.18431, 0.76471], 
+    [0.00000, 0.19608, 0.74118], 
+    [0.00000, 0.21176, 0.72157], 
+    [0.00000, 0.22353, 0.70196], 
+    [0.00000, 0.23529, 0.67843], 
+    [0.00000, 0.25098, 0.65882], 
+    [0.00000, 0.26275, 0.63922], 
+    [0.00000, 0.27451, 0.61569], 
+    [0.00000, 0.28627, 0.59608], 
+    [0.00000, 0.29804, 0.57647], 
+    [0.00000, 0.30980, 0.55686], 
+    [0.00000, 0.32157, 0.53725], 
+    [0.00000, 0.33333, 0.51373], 
+    [0.00000, 0.34510, 0.49412], 
+    [0.00000, 0.35686, 0.47451], 
+    [0.00000, 0.36863, 0.45490], 
+    [0.00000, 0.38039, 0.43529], 
+    [0.00000, 0.39216, 0.41569], 
+    [0.00000, 0.40392, 0.39608], 
+    [0.00000, 0.41176, 0.37647], 
+    [0.00000, 0.42353, 0.35686], 
+    [0.00000, 0.43529, 0.33725], 
+    [0.00000, 0.44706, 0.31765], 
+    [0.00000, 0.45882, 0.29804], 
+    [0.00000, 0.46667, 0.27843], 
+    [0.00000, 0.47843, 0.25882], 
+    [0.00000, 0.49020, 0.23922], 
+    [0.00000, 0.49804, 0.21961], 
+    [0.00000, 0.50980, 0.20000], 
+    [0.00000, 0.52157, 0.18431], 
+    [0.00000, 0.52941, 0.16471], 
+    [0.00000, 0.54118, 0.14510], 
+    [0.00000, 0.55294, 0.12941], 
+    [0.00000, 0.56078, 0.10980], 
+    [0.00000, 0.57255, 0.09412], 
+    [0.00000, 0.58431, 0.07451], 
+    [0.00000, 0.59216, 0.05882], 
+    [0.00000, 0.60392, 0.04314], 
+    [0.00000, 0.61176, 0.02745], 
+    [0.00000, 0.62353, 0.01176], 
+    [0.00000, 0.63137, 0.00000], 
+    [0.00000, 0.64314, 0.00000], 
+    [0.00000, 0.65098, 0.00000], 
+    [0.00000, 0.66275, 0.00000], 
+    [0.00000, 0.67059, 0.00000], 
+    [0.00000, 0.68235, 0.00000], 
+    [0.00000, 0.69020, 0.00000], 
+    [0.00000, 0.70196, 0.00000], 
+    [0.00000, 0.70980, 0.00000], 
+    [0.00000, 0.72157, 0.00000], 
+    [0.00000, 0.72941, 0.00000], 
+    [0.00000, 0.74118, 0.00000], 
+    [0.00000, 0.74902, 0.00000], 
+    [0.00000, 0.76078, 0.00000], 
+    [0.00000, 0.76863, 0.00000], 
+    [0.00000, 0.77647, 0.00000], 
+    [0.00000, 0.78824, 0.00000], 
+    [0.00000, 0.79608, 0.00000], 
+    [0.00000, 0.80784, 0.00000], 
+    [0.00000, 0.81569, 0.00000], 
+    [0.00000, 0.82353, 0.00000], 
+    [0.00000, 0.83529, 0.00000], 
+    [0.00000, 0.84314, 0.00000], 
+    [0.00000, 0.85490, 0.00000], 
+    [0.00000, 0.86275, 0.00000], 
+    [0.00000, 0.87059, 0.00000], 
+    [0.00000, 0.88235, 0.00000], 
+    [0.00000, 0.89020, 0.00000], 
+    [0.00000, 0.89804, 0.00000], 
+    [0.00000, 0.90980, 0.00000], 
+    [0.00000, 0.91765, 0.00000], 
+    [0.00000, 0.92549, 0.00000], 
+    [0.00000, 0.93725, 0.00000], 
+    [0.00000, 0.94510, 0.00000], 
+    [0.00000, 0.95294, 0.00000], 
+    [0.00000, 0.96078, 0.00000], 
+    [0.00000, 0.97255, 0.00000], 
+    [0.00000, 0.98039, 0.00000], 
+    [0.00000, 0.98824, 0.00000], 
+    [0.00000, 1.00000, 0.00000], 
+    [0.00000, 0.98824, 0.00000], 
+    [0.00000, 0.98039, 0.00000], 
+    [0.00000, 0.97255, 0.00000], 
+    [0.00000, 0.96078, 0.00000], 
+    [0.00000, 0.95294, 0.00000], 
+    [0.00000, 0.94510, 0.00000], 
+    [0.00000, 0.93725, 0.00000], 
+    [0.00000, 0.92549, 0.00000], 
+    [0.00000, 0.91765, 0.00000], 
+    [0.00000, 0.90980, 0.00000], 
+    [0.00000, 0.89804, 0.00000], 
+    [0.00000, 0.89020, 0.00000], 
+    [0.00000, 0.88235, 0.00000], 
+    [0.00000, 0.87059, 0.00000], 
+    [0.00000, 0.86275, 0.00000], 
+    [0.00000, 0.85490, 0.00000], 
+    [0.00000, 0.84314, 0.00000], 
+    [0.00000, 0.83529, 0.00000], 
+    [0.00000, 0.82353, 0.00000], 
+    [0.00000, 0.81569, 0.00000], 
+    [0.00000, 0.80784, 0.00000], 
+    [0.00000, 0.79608, 0.00000], 
+    [0.00000, 0.78824, 0.00000], 
+    [0.00000, 0.77647, 0.00000], 
+    [0.00784, 0.76863, 0.00000], 
+    [0.03529, 0.77647, 0.00000], 
+    [0.06667, 0.78824, 0.00000], 
+    [0.09804, 0.80000, 0.00000], 
+    [0.12941, 0.81176, 0.00000], 
+    [0.16471, 0.82745, 0.00000], 
+    [0.20000, 0.84314, 0.00000], 
+    [0.23529, 0.85882, 0.00000], 
+    [0.26667, 0.87059, 0.00000], 
+    [0.30588, 0.89020, 0.00000], 
+    [0.34118, 0.90196, 0.00000], 
+    [0.37647, 0.92157, 0.00000], 
+    [0.41176, 0.93333, 0.00000], 
+    [0.44706, 0.95294, 0.00000], 
+    [0.48627, 0.96863, 0.00000], 
+    [0.52157, 0.98824, 0.00000], 
+    [0.56078, 1.00000, 0.00000], 
+    [0.59608, 1.00000, 0.00000], 
+    [0.63529, 1.00000, 0.00000], 
+    [0.67059, 1.00000, 0.00000], 
+    [0.70980, 1.00000, 0.00000], 
+    [0.74902, 1.00000, 0.00000], 
+    [0.78431, 1.00000, 0.00000], 
+    [0.82353, 1.00000, 0.00000], 
+    [0.85882, 1.00000, 0.00000], 
+    [0.89804, 1.00000, 0.00000], 
+    [0.93333, 1.00000, 0.00000], 
+    [0.97647, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [1.00000, 1.00000, 0.00000], 
+    [0.99608, 1.00000, 0.00000], 
+    [0.98039, 1.00000, 0.00000], 
+    [0.96078, 0.97647, 0.00000], 
+    [0.94510, 0.93725, 0.00000], 
+    [0.92549, 0.89804, 0.00000], 
+    [0.90980, 0.85882, 0.00000], 
+    [0.89412, 0.81961, 0.00000], 
+    [0.87451, 0.78039, 0.00000], 
+    [0.85882, 0.74118, 0.00000], 
+    [0.83922, 0.70196, 0.00000], 
+    [0.82353, 0.66275, 0.00000], 
+    [0.80392, 0.62353, 0.00000], 
+    [0.78824, 0.58431, 0.00000], 
+    [0.76863, 0.54510, 0.00000], 
+    [0.75686, 0.50980, 0.00000], 
+    [0.74118, 0.46667, 0.00000], 
+    [0.72549, 0.43137, 0.00000], 
+    [0.70980, 0.39216, 0.00000], 
+    [0.69412, 0.35294, 0.00000], 
+    [0.68235, 0.31765, 0.00000], 
+    [0.66275, 0.27451, 0.00000], 
+    [0.65098, 0.23922, 0.00000], 
+    [0.63529, 0.20000, 0.00000], 
+    [0.62745, 0.16863, 0.00000], 
+    [0.61569, 0.12941, 0.00000], 
+    [0.60784, 0.09804, 0.00000], 
+    [0.61961, 0.08235, 0.00000], 
+    [0.62745, 0.06275, 0.00000], 
+    [0.63922, 0.04706, 0.00000], 
+    [0.64706, 0.02353, 0.00000], 
+    [0.65882, 0.00000, 0.00000], 
+    [0.66667, 0.00000, 0.00000], 
+    [0.67843, 0.00000, 0.00000], 
+    [0.68627, 0.00000, 0.00000], 
+    [0.69804, 0.00000, 0.00000], 
+    [0.70980, 0.00000, 0.00000], 
+    [0.71765, 0.00000, 0.00000], 
+    [0.72941, 0.00000, 0.00000], 
+    [0.73725, 0.00000, 0.00000], 
+    [0.74902, 0.00000, 0.00000], 
+    [0.75686, 0.00000, 0.00000], 
+    [0.76863, 0.00000, 0.00000], 
+    [0.77647, 0.00000, 0.00000], 
+    [0.78824, 0.00000, 0.00000], 
+    [0.80000, 0.00784, 0.00784], 
+    [0.80784, 0.02745, 0.02745], 
+    [0.81961, 0.05098, 0.05098], 
+    [0.82745, 0.08235, 0.08235], 
+    [0.83922, 0.11373, 0.11373], 
+    [0.84706, 0.14902, 0.14902], 
+    [0.85882, 0.19216, 0.19216], 
+    [0.86667, 0.23137, 0.23137], 
+    [0.87843, 0.27843, 0.27843], 
+    [0.88627, 0.32549, 0.32549], 
+    [0.89804, 0.37647, 0.37647], 
+    [0.90980, 0.43137, 0.43137], 
+    [0.91765, 0.48627, 0.48627], 
+    [0.92941, 0.54118, 0.54118], 
+    [0.93725, 0.60000, 0.60000], 
+    [0.94902, 0.66275, 0.66275], 
+    [0.95686, 0.72549, 0.72549], 
+    [0.96863, 0.79216, 0.79216], 
+    [0.97647, 0.85882, 0.85882], 
+    [0.98824, 0.92941, 0.92941], 
+    [1.00000, 1.00000, 1.00000], 
+    ]) # QFitsView_colormaps_rainbow.lut
+    cmap = ListedColormap(colors=cmaprgb, name='QFitsView_rainbow')
+    if bad is not None:
+        cmap.set_bad(bad)
+    return cmap
+
+
+
 
 
 
@@ -6013,6 +7349,8 @@ if __name__ == '__main__':
     ScreenSize = app.primaryScreen().size()
     
     logger.debug('ScreenSize = ' + str(ScreenSize.width()) + ', ' + str(ScreenSize.height()))
+    
+    app.setWindowIcon(getIconDysmalPy())
 
     # manager = multiprocessing.Manager()
     # queue = manager.Queue()

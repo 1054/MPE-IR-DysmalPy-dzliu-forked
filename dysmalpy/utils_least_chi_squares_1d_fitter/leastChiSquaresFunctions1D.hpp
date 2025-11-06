@@ -91,6 +91,9 @@ namespace LeastChiSquaresFunctionsGaussian1D
         //std::cout << "func4gsl_f variables->size " << variables->size << std::endl;
         for (i=0; i < ndata; i++) {
             double ymodel = 0.0;
+            if (std::isnan(y[i])) {
+                continue;
+            }
             for (j=0; j < (size_t)(variables->size/3); j++) {
                 double A = gsl_vector_get(variables, 3*j+0);
                 double mu = gsl_vector_get(variables, 3*j+1);

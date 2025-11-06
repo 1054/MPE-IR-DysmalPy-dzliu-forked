@@ -584,9 +584,28 @@ class MCMCFitter(base.Fitter):
                             if os.path.isfile(output_options.f_results):
                                 msg = "overwrite={}, and 'f_sampler_results' already contains {} steps,".format(output_options.overwrite,
                                                         backend.get_chain().shape[0])
-                                msg += " so the fit will not be saved.\n Specify new outfile or delete old files."
+                                #msg += " so the fit will not be saved.\n Specify new outfile or delete old files."
+                                msg += " so the fit will not be re-done."
                                 logger.warning(msg)
-                                return None
+                                #return None
+
+                                # restoring an existing mcmcResults
+                                logger.info('Restoring mcmc results from {}'.format(output_options.f_sampler_results))
+                                moves = emcee.moves.StretchMove(a=self.scale_param_a)
+                                kwargs_dict = {'fitter': self}
+                                nDim = gal.model.nparams_free
+                                sampler_results = emcee.EnsembleSampler(self.nWalkers, nDim, base.log_prob,
+                                                                        backend=backend, pool=None, moves=moves,
+                                                                        args=[gal], kwargs=kwargs_dict)
+                                sampler_results_dict = make_emcee_sampler_results_dict(sampler_results, nBurn=0)
+                                mcmcResults = MCMCResults(model=gal.model, sampler_results=sampler_results_dict,
+                                                         linked_posterior_names=self.linked_posterior_names,
+                                                         blob_name=self.blob_name,
+                                                         nPostBins=self.nPostBins)
+                                mcmcResults.analyze_posterior_dist(gal=gal)
+                                gal.model.update_parameters(mcmcResults.bestfit_parameters)
+                                gal.create_model_data()
+                                return mcmcResults
                     else:
                         pass
                 except:
