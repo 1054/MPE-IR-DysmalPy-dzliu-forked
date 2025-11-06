@@ -496,7 +496,7 @@ def plot_corner_mcmc(mcmcResults, gal=None, fileout=None, step_slice=None,
                     ax.set_xlim(xlim)
                     ax.set_ylim(ylim)
 
-    # allow user to adjust param display ranges
+    # allow user to adjust param display ranges 20251106
     if param_ranges is not None:
         # example: param_ranges = {'sigma0': [10.0, 100.0]}
         ipar = -1

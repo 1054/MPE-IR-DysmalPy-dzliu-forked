@@ -36,19 +36,17 @@ fitter = utils_io.setup_fitter(params=params)
 # set output options
 output_options.set_output_options(gal, fitter)
 output_options.overwrite = False
-fit_dict = output_options.as_dict()
-#print('fit_dict', fit_dict)
 
 # restore a previous fitting
 fit_results = fitter.fit(gal, output_options)
 
 # redraw corner plot
 param_ranges = {
-    'sigma0':[5., 80.]
+    'sigma0': [0.5, 35.]
 }
 
-fileout = params['outdir']+'/'+'output_mcmc_corner_updated.pdf'
+fileout = os.path.join(params['outdir'], 'output_mcmc_corner_updated.pdf')
 
-fit_results.plot_corner(gal=gal, param_ranges=param_ranges, fileout=fileout)
+fit_results.plot_corner(gal=gal, param_ranges=param_ranges, fileout=fileout, overwrite=True)
 
 print('Output to {}'.format(fileout))
