@@ -858,7 +858,7 @@ def log_like(gal, fitter=None):
 
                 # Correct model for instrument dispersion if the data is instrument corrected:
                 if obs.fit_options.fit_dispersion & ('inst_corr' in obs.data.data.keys()):
-                    if obs.data.data['inst_corr']:
+                    if obs.data.data['inst_corr'] and obs.instrument.lsf is not None:
                         disp_mod = np.sqrt(disp_mod**2 -
                                            obs.instrument.lsf.dispersion.to(u.km/u.s).value**2)
                         disp_mod[~np.isfinite(disp_mod)] = 0   # Set the dispersion to zero when its below

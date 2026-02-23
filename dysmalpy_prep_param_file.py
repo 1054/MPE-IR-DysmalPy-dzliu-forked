@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import os, sys, re, json, copy, click, shutil
+import os, sys, re, json, copy, click, shutil, time, datetime
 import numpy as np
 import astropy.units as u
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
+from astropy.wcs.utils import proj_plane_pixel_area, proj_plane_pixel_scales
+from reproject import reproject_interp
 from astropy.convolution import convolve, Gaussian2DKernel
 from astropy.modeling import models as apy_models
 from astropy.modeling import fitting as apy_fitting
@@ -27,10 +29,13 @@ if len(sys.argv) <= 1:
     sys.exit()
 
 
+
 @click.command()
 @click.argument('input_data_cube', type=click.Path(exists=True))
 @click.option('--name', type=str, default='MyGalaxy', help='galaxy ID/name')
 @click.option('--redshift', type=float, default=0.0, help='galaxy ID/name')
+@click.option('--fov', type=float, default=None, help='cutout field of view in arcsec, default is no cutout.')
+@click.option('--vlsrk', type=float, default=None, help='system center velocity in LSRK frame in km/s, default is no cutout.')
 @click.option('--inc', type=float, default=45., help='galaxy initial inclination')
 @click.option('--pa', type=float, default=45., help='galaxy initial PA') # the red (receding) side major axis position angle, north is 0
 @click.option('--beam-fwhm', type=float, default=None, help='beam (point spread function) FWHM in arcsec, if no beam is in the FITS header')
@@ -43,7 +48,7 @@ if len(sys.argv) <= 1:
 @click.option('--do-params/--no-params', type=bool, is_flag=True, default=True, help='make params file?')
 @click.option('--region-mask', type=click.Path(exists=True), default=None, help='A DS9-format region mask for valid area. If a region mask file is set, then --no-auto-mask is set.')
 @click.option('--do-auto-mask/--no-auto-mask', type=bool, is_flag=True, default=True, help='make auto mask?')
-def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift, y_shift, vel_shift, 
+def main(input_data_cube, name, redshift, fov, vlsrk, inc, pa, beam_fwhm, lsf_sigma, x_shift, y_shift, vel_shift, 
          do_contsub, line_mask, do_params, region_mask, do_auto_mask):
 
     ## Prepare data, data error and mask cubes
@@ -95,12 +100,12 @@ def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift
     i = 1
     ispec = -1
     while i <= header['NAXIS']:
-        if header[f'CTYPE{i}'] in ['FREQ', 'VELO', 'WAVE']:
+        if header[f'CTYPE{i}'] in ['FREQ', 'VELO', 'VOPT', 'VRAD', 'WAVE']:
             ispec = i
             break
         i += 1
     if ispec == -1:
-        raise Exception('Error! The input fits file does not contain spectral axis? CTYPE should be {}'.format(['FREQ', 'VELO', 'WAVE']))
+        raise Exception('Error! The input fits file does not contain spectral axis? CTYPE should be {}'.format(['FREQ', 'VELO', 'VOPT', 'VRAD', 'WAVE']))
     print(f'spectral axis: {ispec}')
 
     if ispec != 3:
@@ -151,16 +156,75 @@ def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift
         for key in ['CD3_3', 'PC3_3']:
             if key in header:
                 del header[key]
-    elif header['CTYPE3'] == 'VELO':
+    elif header['CTYPE3'] in ['VELO', 'VOPT', 'VRAD']:
         vel_axis = (np.arange(header['NAXIS3'])+1 - header['CRPIX3']) * header['CDELT3'] + header['CRVAL3']
         if u.Unit(header['CUNIT3']) != u.Unit('km/s'):
             vel_axis = (vel_axis * u.Unit(header['CUNIT3'])).to(u.Unit('km/s')).value
+            header['CDELT3'] = (header['CDELT3'] * u.Unit(header['CUNIT3'])).to(u.Unit('km/s')).value
+            header['CRVAL3'] = (header['CRVAL3'] * u.Unit(header['CUNIT3'])).to(u.Unit('km/s')).value
             header['CUNIT3'] = 'km/s'
+        header['CTYPE3'] = 'VELO'
     else:
         raise NotImplementedError('Converting CTYPE3 {} to velocity is not implemented!'.format(header['CTYPE3']))
 
-    # pad to square
+    if 'PC1_1' in header and header['PC1_1'] == 1.0:
+        for key in ['PC1_1', 'PC1_2', 'PC1_3', 'PC2_1', 'PC2_2', 'PC2_3', 'PC3_1', 'PC3_2', 'PC3_3']:
+            if key in header:
+                del header[key]
+    
+    # cut to fov
     nchan, ny, nx = data.shape
+    if fov is not None:
+        original_data = data.copy()
+        original_header = copy.deepcopy(header)
+        wcs = WCS(header, naxis=2)
+        pixscale = np.sqrt(proj_plane_pixel_area(wcs))*3600.
+        x_size = int(np.ceil(fov / pixscale))
+        y_size = int(np.ceil(fov / pixscale))
+        new_data = np.zeros([nchan, y_size, x_size])
+        x_pixsc = pixscale
+        y_pixsc = pixscale
+        center_RA, center_Dec = wcs.wcs_pix2world([(nx-1)/2.0], [(ny-1)/2.0], 0)
+        center_RA, center_Dec = center_RA[0], center_Dec[0]
+        cutout_header = fits.Header()
+        cutout_header['BITPIX'] = -32
+        cutout_header['NAXIS'] = 2
+        cutout_header['NAXIS1'] = x_size
+        cutout_header['NAXIS2'] = y_size
+        cutout_header['CTYPE1'] = 'RA---TAN'
+        cutout_header['CTYPE2'] = 'DEC--TAN'
+        cutout_header['CUNIT1'] = 'deg'
+        cutout_header['CUNIT2'] = 'deg'
+        cutout_header['CDELT1'] = -x_pixsc / 3600.0
+        cutout_header['CDELT2'] = y_pixsc / 3600.0
+        cutout_header['CRPIX1'] = (x_size+1)/2. # 1-based number
+        cutout_header['CRPIX2'] = (y_size+1)/2. # 1-based number
+        cutout_header['CRVAL1'] = center_RA
+        cutout_header['CRVAL2'] = center_Dec
+        cutout_header['RADESYS'] = 'ICRS'
+        cutout_header['EQUINOX'] = 2000
+        #'NAXIS','NAXIS1','NAXIS2','CDELT1','CDELT2','CRPIX1','CRPIX2','CRVAL1','CRVAL2',
+        for key in ['BUNIT','BMAJ','BMIN','BPA','TELESCOP','INSTRUME','FILTER','EXPTIME','PA_V3',
+                    'DATE-OBS','TIME-OBS','PHOTMODE','PHOTFLAM','PHTFLAM1','PHTFLAM2','PHTRATIO','PHOTFNU','PHOTZPT','PHOTPLAM','PHOTBW',
+                    'S_REGION',]:
+            if key in header:
+                cutout_header[key] = header[key]
+
+        for ichan in range(nchan):
+            image = original_data[ichan, :, :]
+            cutout_image, cutout_footprint = reproject_interp((image, wcs), cutout_header)
+            new_data[ichan, :, :] = cutout_image
+
+        data = new_data
+
+        for key in cutout_header:
+            if key in ['BITPIX', 'NAXIS']:
+                continue
+            header[key] = cutout_header[key]
+
+    nchan, ny, nx = data.shape
+
+    # pad to square
     if nx < ny:
         pad1 = int((ny-nx)/2)
         pad2 = (ny-nx)-pad1
@@ -175,7 +239,14 @@ def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift
         data_pad[:, pad1:-pad2, :] = data[:, :, :]
         header['CRPIX2'] = header['CRPIX2'] + pad1
         header['NAXIS2'] = header['NAXIS2'] + pad1 + pad2
-    
+    else:
+        data_pad = data
+
+    # shift to LSRK
+    if vlsrk is not None:
+        header['CRVAL3'] -= vlsrk
+        vel_axis -= vlsrk
+
     # check overall spectrum
     # spec_data = np.nanmean(data_pad, axis=(1,2))
     # gauss_model = apy_models.Gaussian1D(amplitude=np.nanmax(spec_data), mean=0.0, stddev=50.0)
@@ -186,7 +257,7 @@ def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift
     # cont_mask = (vel_axis < gauss_center - gauss_fwhz)
     if do_contsub:
         if line_mask is None:
-            line_mask = [-120, 120]
+            line_mask = [-120, 120] # km/s
         cont_mask = np.logical_or(vel_axis < line_mask[0], vel_axis > line_mask[1])
         if np.count_nonzero(cont_mask) == 0:
             raise Exception('Error! There is no continuum channel after line masking!')
@@ -282,7 +353,7 @@ def main(input_data_cube, name, redshift, inc, pa, beam_fwhm, lsf_sigma, x_shift
     x_shift_min = x_shift - 5.
     y_shift_min = y_shift - 5.
     vel_shift_min = vel_shift - 10.
-    inc_max = np.round(np.rad2deg(np.asin(max(0.0, np.sin(np.deg2rad(inc)) + 0.3))), 0)
+    inc_max = np.round(np.rad2deg(np.asin(min(1.0, np.sin(np.deg2rad(inc)) + 0.3))), 0)
     pa_max = pa + 15.
     x_shift_max = x_shift + 5.
     y_shift_max = y_shift + 5.

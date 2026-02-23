@@ -710,6 +710,12 @@ class QDysmalPyGUI(QMainWindow):
                     datatype=str,
                     fullwidth=True,
                     isdatafile=True, namefilter=self.tr('FITS file (*.fits *.fits.gz)'), defaultdir=self.DefaultDirectory, enabled=False)
+        self.LineEditDataParamsDict['fdata_err'] = QWidgetForParamInput(\
+                    keyname=self.tr('fdata_err'),
+                    keycomment=self.tr('3D data error cube.'),
+                    datatype=str,
+                    fullwidth=True,
+                    isdatafile=True, namefilter=self.tr('FITS file (*.fits *.fits.gz)'), defaultdir=self.DefaultDirectory, enabled=False)
         self.LineEditDataParamsDict['outdir'] = QWidgetForParamInput(\
                     keyname=self.tr('outdir'),
                     keycomment=self.tr('Output directory.'),
@@ -1352,7 +1358,7 @@ class QDysmalPyGUI(QMainWindow):
         #self.PanelSpecA = QWidget()
         #self.PanelSpecB = QWidget()
         #
-        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube']:
+        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube', 'fdata_err']:
             self.LineEditDataParamsDict['datadir'].ParamUpdateSignal.connect(self.LineEditDataParamsDict[keyname].onDataDirParamUpdateCall)
         #
         # Panel Left layout
@@ -1955,7 +1961,7 @@ class QDysmalPyGUI(QMainWindow):
                     return
         
         # for data related keys, if keyvalue is set to None, then we delete the key in the dict DysmalPyParams
-        if keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube'] and \
+        if keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube', 'fdata_err'] and \
            keyname in self.DysmalPyParams and \
            keyvalue is None:
             del self.DysmalPyParams[keyname]
@@ -2232,7 +2238,7 @@ class QDysmalPyGUI(QMainWindow):
         #
         self.DysmalPyParamFile = filepath
         self.DysmalPyParams = params
-        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube']:
+        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube', 'fdata_err']:
             if keyname not in params:
                 self.LineEditDataParamsDict[keyname].setText('', blocksignal=True)
                 self.LineEditDataParamsDict[keyname].setEnabled(False)
@@ -2301,7 +2307,7 @@ class QDysmalPyGUI(QMainWindow):
         if self.DysmalPyParams['outdir'] is None or self.DysmalPyParams['outdir'] == '':
             errormessages.append('outdir is None')
         hasdata = False
-        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube']:
+        for keyname in ['fdata', 'fdata_flux', 'fdata_ferr', 'fdata_vel', 'fdata_verr', 'fdata_disp', 'fdata_derr', 'fdata_mask', 'fdata_cube', 'fdata_err']:
             if keyname in self.DysmalPyParams:
                 hasdata = True
                 if self.DysmalPyParams['datadir'] is None or self.DysmalPyParams['datadir'] == '':
@@ -4469,7 +4475,8 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             return
         # 
         gal.data = gal.observations['OBS'].data # 20250827 fix for compatible issue
-        gal.model_cube = gal.observations['OBS'].model_cube # 20250827 fix for compatible issue
+        #gal.model_cube = gal.observations['OBS'].model_cube # 20250827 fix for compatible issue
+        gal.model_cube = gal.observations['OBS'].model_data # 20251117 the flux rescaled model cube is obs.model_data
         # 
         self.data_cube = None
         if hasattr(gal, 'data'):
@@ -4493,7 +4500,7 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         # 
         self.send_lensing_data_to_queue()
         #
-        print('generate_moment_maps', 'L4491')
+        #print('generate_moment_maps', 'L4491')
         self.generate_moment_maps(params, gal, block_signal = True)
         if self.last_log_message.startswith('Error!'):
             if not block_signal:
@@ -4616,6 +4623,7 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         # print('obs.lensing_options', obs.lensing_options)
         # print('kwargs_galmodel', kwargs_galmodel)
         if 'lensing_mesh' in params:
+            obs = gal.observations[list(gal.observations.keys())[0]]
             obs.lensing_options.load(**kwargs_galmodel)
             print('obs.lensing_options.get_lensing_kwargs()', obs.lensing_options.get_lensing_kwargs(oversample=obs.mod_options.oversample, oversize=obs.mod_options.oversize))
         #print('obs.instrument.smoothing_type', obs.instrument.smoothing_type)
@@ -4637,16 +4645,20 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         #                    )
         #print('obs.model_cube.data', obs.model_cube.data)
         #fits.PrimaryHDU(data=obs.model_cube.data).writeto('tmp.obs.model_cube.fits', overwrite=True)
-        gal.model_cube = obs.model_cube
-        gal.model_data = obs.model_data
+        #gal.model_cube = obs.model_cube
+        gal.model_cube = obs.model_data
         gal.data = obs.data
         #self.logger.debug("self.lensing_transformer " + str(self.lensing_transformer))
         #self.logger.debug("kwargs_galmodel['lensing_transformer'] " + str(kwargs_galmodel['lensing_transformer']))
         #
         # 20240830 new dysmalpy
-        self.model_cube = copy.copy(gal.model_cube.data)
+        #self.model_cube = copy.copy(gal.model_cube.data)
         #self.model_cube_data_array = self.model_cube._data
         #self.model_cube_header_info = self.model_cube._header
+        #
+        # 20251117 new dysmalpy -- the flux rescaled model cube is obs.model_data
+        self.model_cube = copy.copy(obs.model_data.data)
+        # 
         if gal.data.mask is not None: #20251008
             self.model_cube = self.model_cube.with_mask(gal.data.mask) #20251008
             #print('self.model_cube = self.model_cube.with_mask(gal.data.mask) #20251008')
@@ -4818,14 +4830,6 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
             if not block_signal:
                 self.emit_finished_with_error(err_msg)
             return
-        if gal.model_cube is None:
-            err_msg = 'Error! DysmalPyGal.model_cube is invalid! ' + \
-                      'Could not proceed to generate the moment maps. ' + \
-                      'Please run generate_model_cube first!'
-            self.log_message(err_msg)
-            if not block_signal:
-                self.emit_finished_with_error(err_msg)
-            return
         #
         model_flux_map = None
         model_vel_map = None
@@ -4835,17 +4839,27 @@ class QDysmalPyFittingStarship(multiprocessing.context.SpawnProcess):
         if not hasattr(gal, 'data'): 
             if hasattr(gal, 'observations'):
                 gal.data = gal.observations['OBS'].data
+                gal.model_cube = gal.observations['OBS'].model_data # 20251117 the flux rescaled model cube is obs.model_data
         if not hasattr(gal, 'instrument'): 
             if hasattr(gal, 'observations'):
                 gal.instrument = gal.observations['OBS'].instrument
+        # 
+        if gal.model_cube is None:
+            err_msg = 'Error! DysmalPyGal.model_cube is invalid! ' + \
+                      'Could not proceed to generate the moment maps. ' + \
+                      'Please run generate_model_cube first!'
+            self.log_message(err_msg)
+            if not block_signal:
+                self.emit_finished_with_error(err_msg)
+            return
         # 
         data_mask = None
         if hasattr(gal, 'data'):
             if hasattr(gal.data, 'ndim'):
                 if gal.data.ndim in [2, 3]:
                     data_mask = gal.data.mask
-        if data_mask is not None:
-            print('***DEBUG*** np.count_nonzero(data_mask)', np.count_nonzero(data_mask), 'data_mask.shape', data_mask.shape)
+        #if data_mask is not None:
+        #    print('***DEBUG*** np.count_nonzero(data_mask)', np.count_nonzero(data_mask), 'data_mask.shape', data_mask.shape)
         #
         model_flux_map, model_vel_map, model_disp_map = \
             self.compute_moment_maps_from_cube(params, gal.model_cube.data, data_mask)

@@ -754,7 +754,7 @@ def plot_data_model_comparison_1D(obs, fileout=None, overwrite=False):
         inst_corr = data.data['inst_corr']
 
 
-    if inst_corr:
+    if inst_corr and obs.instrument.lsf is not None:
             model_data.data['dispersion'] = \
                 np.sqrt( model_data.data['dispersion']**2 - \
                     obs.instrument.lsf.dispersion.to(u.km/u.s).value**2 )
@@ -1129,7 +1129,7 @@ def plot_data_model_comparison_2D(obs, model,
                     vmin = vel_vmin
                     vmax = vel_vmax
                 elif keyyarr[j] == 'dispersion':
-                    if inst_corr:
+                    if inst_corr and obs.instrument.lsf is not None:
                         im = np.sqrt(im ** 2 - obs.instrument.lsf.dispersion.to(
                                      u.km / u.s).value ** 2)
                     vmin = disp_vmin
@@ -1143,7 +1143,7 @@ def plot_data_model_comparison_2D(obs, model,
                 im_data = obs.data.data[keyyarr[j]].copy()
                 im_model = obs.model_data.data[keyyarr[j]].copy()
                 if keyyarr[j] == 'dispersion':
-                    if inst_corr:
+                    if inst_corr and obs.instrument.lsf is not None:
                         im_model = np.sqrt(im_model ** 2 -
                                        obs.instrument.lsf.dispersion.to( u.km / u.s).value ** 2)
                 im = im_data - im_model
@@ -1321,7 +1321,7 @@ def plot_3D_extracted_to_1D_2D(obs_in, model_in,
     # Data haven't actually been corrected for instrument LSF yet
     # (Note: 1D/2D *models* will be corrected for LSF during plotting,
     #        based on the data['inst_corr'] setting)
-    if obs_extract['extract_1D'].data.data['inst_corr']:
+    if obs_extract['extract_1D'].data.data['inst_corr'] and obs_extract['extract_1D'].instrument.lsf is not None:
         inst_corr_sigma = obs_extract['extract_1D'].instrument.lsf.dispersion.to(u.km/u.s).value
         disp_prof_1D = np.sqrt(obs_extract['extract_1D'].data.data['dispersion']**2 - inst_corr_sigma**2 )
         disp_prof_1D[~np.isfinite(disp_prof_1D)] = 0.
@@ -1333,7 +1333,7 @@ def plot_3D_extracted_to_1D_2D(obs_in, model_in,
             obs_extract['extract_1D'].data.filled_mask_data.data['dispersion'] = disp_prof_1D
 
 
-    if obs_extract['extract_2D'].data.data['inst_corr']:
+    if obs_extract['extract_2D'].data.data['inst_corr'] and obs_extract['extract_2D'].instrument.lsf is not None:
         inst_corr_sigma = obs_extract['extract_2D'].instrument.lsf.dispersion.to(u.km/u.s).value
         im = obs_extract['extract_2D'].data.data['dispersion'].copy()
         im = np.sqrt(im ** 2 - inst_corr_sigma ** 2)
@@ -2783,7 +2783,7 @@ def plot_single_obs_model_1D(obs,
 
     model_data = copy.deepcopy(obs.model_data)
 
-    if inst_corr:
+    if inst_corr and obs.instrument.lsf is not None:
             model_data.data['dispersion'] = \
                 np.sqrt( model_data.data['dispersion']**2 - \
                     obs.instrument.lsf.dispersion.to(u.km/u.s).value**2 )

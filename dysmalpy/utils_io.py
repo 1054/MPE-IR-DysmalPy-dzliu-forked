@@ -122,7 +122,7 @@ def write_model_1d_obs_file(obs=None, fname=None, overwrite=False):
     model_disp = obs.model_data.data['dispersion']
 
     # Correct dispersion for instrumental resolution of data is inst-corrected:
-    if 'inst_corr' in obs.data.data.keys():
+    if 'inst_corr' in obs.data.data.keys() and obs.instrument.lsf is not None:
         if obs.data.data['inst_corr']:
             model_disp = np.sqrt( model_disp**2 - obs.instrument.lsf.dispersion.to(u.km/u.s).value**2 )
             model_disp[~np.isfinite(model_disp)] = 0
@@ -156,7 +156,7 @@ def write_model_2d_obs_file(obs=None, model=None, fname=None, overwrite=False):
 
     # Correct model for instrument dispersion if the data is instrument corrected:
     if ('inst_corr' in obs.data.data.keys()) & (obs.model_data.data['dispersion'] is not None):
-        if obs.data.data['inst_corr']:
+        if obs.data.data['inst_corr'] and obs.instrument.lsf is not None:
             disp_mod = np.sqrt(disp_mod**2 -
                                obs.instrument.lsf.dispersion.to(u.km/u.s).value**2)
             disp_mod[~np.isfinite(disp_mod)] = 0   # Set the dispersion to zero when its below

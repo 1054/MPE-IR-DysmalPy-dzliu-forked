@@ -97,7 +97,7 @@ def _chisq_generalized(gal, red_chisq=None):
 
                     # Correct model for instrument dispersion if the data is instrument corrected:
                     if 'inst_corr' in obs.data.data.keys():
-                        if obs.data.data['inst_corr']:
+                        if obs.data.data['inst_corr'] and obs.instrument.lsf is not None:
                             disp_mod = np.sqrt(disp_mod**2 -
                                                obs.instrument.lsf.dispersion.to(u.km/u.s).value**2)
                             disp_mod[~np.isfinite(disp_mod)] = 0   # Set the dispersion to zero when its below
@@ -222,7 +222,7 @@ def _chisq_general_per_type(obs, type=None, red_chisq=True, nparams_free=None, *
 
         # Correct model for instrument dispersion if the data is instrument corrected:
         if 'inst_corr' in obs.data.data.keys():
-            if obs.data.data['inst_corr']:
+            if obs.data.data['inst_corr'] and obs.instrument.lsf is not None:
                 disp_mod = np.sqrt(disp_mod**2 -
                                    obs.instrument.lsf.dispersion.to(u.km/u.s).value**2)
                 disp_mod[~np.isfinite(disp_mod)] = 0   # Set the dispersion to zero when its below
